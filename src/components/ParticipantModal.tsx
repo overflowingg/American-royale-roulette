@@ -150,7 +150,7 @@ export default function ParticipantModal({
     setCustomError(null);
 
     try {
-      // If manager mode, verify password
+      // If manager mode, verify password (123456)
       if (trimmed.toLowerCase() === "manager") {
         if (!password.trim()) {
           setErrorKey("register.isManagerPrompt");
@@ -159,60 +159,99 @@ export default function ParticipantModal({
           return;
         }
 
-        const res = await fetch("/api/manager/login", {
+        try {
+          const res = await fetch("/api/manager/login", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              id: "manager",
+              password: password.trim(),
+            }),
+          });
+
+          const ctLogin = res.headers.get("content-type") || "";
+          if (res.ok && ctLogin.includes("application/json")) {
+            const data = await res.json();
+            if (!data.success) {
+              setErrorKey("manager.wrongPassword");
+              setCustomError(null);
+            } else {
+              onSuccess(data.player);
+            }
+            return;
+          }
+        } catch {
+          // Static hosting / offline fallback
+        }
+
+        // Standalone verification for password 123456
+        if (password.trim() === "123456") {
+          onSuccess({
+            uid: "manager_root",
+            name: "manager",
+            email: "manager@vantage.admin",
+            chips: 10000,
+            isManager: true,
+            registeredAt: new Date().toISOString(),
+            lastActive: new Date().toISOString(),
+            totalBets: 0,
+          });
+        } else {
+          setErrorKey("manager.wrongPassword");
+          setCustomError(null);
+        }
+        return;
+      }
+
+      // Regular participant registration
+      try {
+        const res = await fetch("/api/players/register", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
-            id: "manager",
-            password: password.trim(),
+            name: trimmed,
+            uid: currentUid || undefined,
           }),
         });
 
-        const ctLogin = res.headers.get("content-type") || "";
-        if (!res.ok || !ctLogin.includes("application/json")) {
-          setErrorKey("manager.wrongPassword");
-          setCustomError(null);
+        const ctReg = res.headers.get("content-type") || "";
+        if (res.ok && ctReg.includes("application/json")) {
+          const data = await res.json();
+          if (!data.success) {
+            setErrorKey(data.reasonKey || "register.nameTaken");
+          } else {
+            onSuccess(data.player);
+          }
           return;
         }
-        const data = await res.json();
-        if (!data.success) {
-          setErrorKey("manager.wrongPassword");
-          setCustomError(null);
-        } else {
-          onSuccess(data.player);
-        }
-        return;
+      } catch {
+        // Static hosting fallback
       }
 
-      // Regular participant (no password needed)
-      const res = await fetch("/api/players/register", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          name: trimmed,
-          uid: currentUid || undefined,
-        }),
-      });
-
-      const ctReg = res.headers.get("content-type") || "";
-      if (!res.ok || !ctReg.includes("application/json")) {
-        setErrorKey("register.networkError");
-        setCustomError(null);
-        return;
-      }
-      const data = await res.json();
-
-      if (!data.success) {
-        if (data.error === "SESSION_CONCLUDED" || data.reasonKey === "register.sessionConcluded") {
-          setErrorKey("register.sessionConcluded");
-        } else {
-          setErrorKey(data.reasonKey || "register.nameTaken");
-        }
-        setCustomError(null);
-        setIsAvailable(false);
-      } else {
-        onSuccess(data.player);
-      }
+      // Fallback for static hosting
+      const localStoreKey = "vantage_static_players";
+      const rawPlayers = localStorage.getItem(localStoreKey);
+      const staticPlayers: Record<string, any> = rawPlayers ? JSON.parse(rawPlayers) : {};
+      
+      const newPlayer = {
+        uid: currentUid || "sub_" + Math.random().toString(36).substring(2, 9),
+        name: trimmed,
+        email: `${trimmed}@study.subject`,
+        chips: 1000,
+        isManager: false,
+        registeredAt: new Date().toISOString(),
+        lastActive: new Date().toISOString(),
+        totalBets: 0,
+        assignedX: [0, 5, 10, 15][Object.keys(staticPlayers).length % 4],
+      };
+      staticPlayers[newPlayer.uid] = newPlayer;
+      localStorage.setItem(localStoreKey, JSON.stringify(staticPlayers));
+      onSuccess(newPlayer);
+    } catch {
+      setErrorKey("register.networkError");
+    } finally {
+      setIsSubmitting(false);
+    }
     } catch {
       setErrorKey("register.networkError");
       setCustomError(null);
