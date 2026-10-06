@@ -150,7 +150,7 @@ export default function ParticipantModal({
     setCustomError(null);
 
     try {
-      // If manager mode, verify password (123456)
+      // If manager mode, verify password
       if (trimmed.toLowerCase() === "manager") {
         if (!password.trim()) {
           setErrorKey("register.isManagerPrompt");
@@ -181,10 +181,10 @@ export default function ParticipantModal({
             return;
           }
         } catch {
-          // Static hosting / offline fallback
+          // Server offline or static hosting (e.g. GitHub Pages)
         }
 
-        // Standalone verification for password 123456
+        // Standalone/static fallback check
         if (password.trim() === "123456") {
           onSuccess({
             uid: "manager_root",
@@ -203,7 +203,7 @@ export default function ParticipantModal({
         return;
       }
 
-      // Regular participant registration
+      // Regular participant (no password needed)
       try {
         const res = await fetch("/api/players/register", {
           method: "POST",
@@ -218,7 +218,13 @@ export default function ParticipantModal({
         if (res.ok && ctReg.includes("application/json")) {
           const data = await res.json();
           if (!data.success) {
-            setErrorKey(data.reasonKey || "register.nameTaken");
+            if (data.error === "SESSION_CONCLUDED" || data.reasonKey === "register.sessionConcluded") {
+              setErrorKey("register.sessionConcluded");
+            } else {
+              setErrorKey(data.reasonKey || "register.nameTaken");
+            }
+            setCustomError(null);
+            setIsAvailable(false);
           } else {
             onSuccess(data.player);
           }
@@ -228,30 +234,41 @@ export default function ParticipantModal({
         // Static hosting fallback
       }
 
-      // Fallback for static hosting
+      // Fallback for static hosting (GitHub Pages)
       const localStoreKey = "vantage_static_players";
       const rawPlayers = localStorage.getItem(localStoreKey);
       const staticPlayers: Record<string, any> = rawPlayers ? JSON.parse(rawPlayers) : {};
       
-      const newPlayer = {
-        uid: currentUid || "sub_" + Math.random().toString(36).substring(2, 9),
-        name: trimmed,
-        email: `${trimmed}@study.subject`,
-        chips: 1000,
-        isManager: false,
-        registeredAt: new Date().toISOString(),
-        lastActive: new Date().toISOString(),
-        totalBets: 0,
-        assignedX: [0, 5, 10, 15][Object.keys(staticPlayers).length % 4],
-      };
-      staticPlayers[newPlayer.uid] = newPlayer;
-      localStorage.setItem(localStoreKey, JSON.stringify(staticPlayers));
-      onSuccess(newPlayer);
-    } catch {
-      setErrorKey("register.networkError");
-    } finally {
-      setIsSubmitting(false);
-    }
+      const existingUid = Object.keys(staticPlayers).find(
+        (id) => staticPlayers[id]?.name?.trim().toLowerCase() === trimmed.toLowerCase()
+      );
+
+      if (existingUid) {
+        const existing = staticPlayers[existingUid];
+        if (existing.hasLeft || existing.chips <= 0) {
+          setErrorKey("register.sessionConcluded");
+          setCustomError(null);
+          return;
+        }
+        onSuccess(existing);
+      } else {
+        const conds = [0, 5, 10, 15];
+        const assignedX = conds[Object.keys(staticPlayers).length % conds.length];
+        const newPlayer = {
+          uid: currentUid || "sub_" + Math.random().toString(36).substring(2, 9),
+          name: trimmed,
+          email: `${trimmed}@study.subject`,
+          chips: 1000,
+          isManager: false,
+          registeredAt: new Date().toISOString(),
+          lastActive: new Date().toISOString(),
+          totalBets: 0,
+          assignedX,
+        };
+        staticPlayers[newPlayer.uid] = newPlayer;
+        localStorage.setItem(localStoreKey, JSON.stringify(staticPlayers));
+        onSuccess(newPlayer);
+      }
     } catch {
       setErrorKey("register.networkError");
       setCustomError(null);
