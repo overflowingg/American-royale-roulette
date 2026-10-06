@@ -1,0 +1,16 @@
+{
+  "players": {
+    "manager_root": {
+      "uid": "manager_root",
+      "name": "manager",
+      "email": "manager@vantage.admin",
+      "chips": 10000,
+      "isManager": true,
+      "registeredAt": "2026-10-06T07:55:00.840Z",
+      "lastActive": "2026-10-06T08:16:53.452Z",
+      "totalBets": 0
+    }
+  },
+  "bets": [],
+  "history": []
+}

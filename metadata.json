@@ -1,0 +1,6 @@
+{
+  "name": "American Royale Roulette",
+  "description": "An experimental American Roulette research platform with mandatory unique participant registration, exclusive Red/Green betting protocol, bilingual English/Chinese localization, and manager analytics.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

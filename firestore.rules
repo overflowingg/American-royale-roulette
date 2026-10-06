@@ -1,0 +1,91 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // 1. Global Safety Net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // --- Helpers ---
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(uid) {
+      return isSignedIn() && request.auth.uid == uid;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    // Auth tokens can't be trusted for roles in this skill, use lookups.
+    // However, for efficiency in this simulation, we check the 'players' collection.
+    function isManager() {
+      return isSignedIn() && 
+        get(/databases/$(database)/documents/players/$(request.auth.uid)).data.isManager == true;
+    }
+
+    // --- Validation Blueprints ---
+
+    function isValidPlayer(data) {
+      return data.uid is string && data.uid == request.auth.uid &&
+             data.email is string && data.email.size() <= 256 &&
+             data.chips is number && data.chips >= 0 &&
+             data.isManager is bool &&
+             data.keys().hasAll(['uid', 'email', 'chips', 'isManager', 'lastActive']) &&
+             data.keys().size() == 5;
+    }
+
+    function isValidBet(data) {
+      return data.playerId is string && data.playerId == request.auth.uid &&
+             data.amount is number && data.amount > 0 && data.amount <= 10000 &&
+             data.betType is string && data.betValue is string &&
+             data.status in ['pending', 'won', 'lost'] &&
+             data.timestamp == request.time;
+    }
+
+    // --- Match Rules ---
+
+    match /players/{uid} {
+      allow get: if isOwner(uid) || isManager();
+      allow list: if isManager();
+      
+      allow create: if isOwner(uid) && isValidPlayer(incoming()) && incoming().isManager == false;
+      
+      allow update: if isOwner(uid) && isValidPlayer(incoming()) && 
+        incoming().isManager == existing().isManager && // Prevent self-elevation
+        (
+          // Action: Normal balance update
+          incoming().diff(existing()).affectedKeys().hasOnly(['chips', 'lastActive'])
+        );
+        
+      allow update: if isManager() && incoming().diff(existing()).affectedKeys().hasOnly(['chips', 'isManager']);
+    }
+
+    match /games/{gameId} {
+      allow get, list: if isSignedIn();
+      allow create: if isManager(); // Only system/manager creates results
+    }
+
+    match /bets/{betId} {
+      allow get: if isOwner(existing().playerId) || isManager();
+      allow list: if isManager() || (isSignedIn() && resource.data.playerId == request.auth.uid);
+      
+      allow create: if isSignedIn() && isValidBet(incoming()) && isOwner(incoming().playerId);
+      
+      allow update: if isManager() && (
+        incoming().status in ['won', 'lost'] &&
+        incoming().diff(existing()).affectedKeys().hasOnly(['status', 'payout'])
+      );
+    }
+  }
+}

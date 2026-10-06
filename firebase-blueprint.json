@@ -1,0 +1,61 @@
+{
+  "entities": {
+    "Player": {
+      "title": "Player",
+      "description": "Represents a user in the roulette game",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string" },
+        "email": { "type": "string" },
+        "chips": { "type": "number", "description": "Virtual currency balance" },
+        "lastActive": { "type": "string", "format": "date-time" },
+        "isManager": { "type": "boolean" }
+      },
+      "required": ["uid", "email", "chips"]
+    },
+    "GameResult": {
+      "title": "Game Result",
+      "description": "Record of a single spin result",
+      "type": "object",
+      "properties": {
+        "gameId": { "type": "string" },
+        "winningNumber": { "type": "string" },
+        "winningColor": { "type": "string" },
+        "timestamp": { "type": "string", "format": "date-time" }
+      },
+      "required": ["winningNumber", "winningColor", "timestamp"]
+    },
+    "Bet": {
+      "title": "Bet",
+      "description": "A bet placed by a player in a specific game",
+      "type": "object",
+      "properties": {
+        "betId": { "type": "string" },
+        "playerId": { "type": "string" },
+        "playerEmail": { "type": "string" },
+        "gameId": { "type": "string" },
+        "betType": { "type": "string" },
+        "betValue": { "type": "string", "description": "e.g. 'Red', 'Even', '17', '1st 12'" },
+        "amount": { "type": "number" },
+        "payout": { "type": "number" },
+        "status": { "type": "string", "enum": ["pending", "won", "lost"] },
+        "timestamp": { "type": "string", "format": "date-time" }
+      },
+      "required": ["playerId", "amount", "betType", "betValue", "status", "timestamp"]
+    }
+  },
+  "firestore": {
+    "/players/{uid}": {
+      "schema": "Player",
+      "description": "User profiles and chip balances"
+    },
+    "/games/{gameId}": {
+      "schema": "GameResult",
+      "description": "History of all roulette spins"
+    },
+    "/bets/{betId}": {
+      "schema": "Bet",
+      "description": "All bets placed by all players"
+    }
+  }
+}
