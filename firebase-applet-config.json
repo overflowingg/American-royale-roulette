@@ -1,1 +1,12 @@
-{}
+{
+  "projectId": "ai-studio-applet-webapp-325b1",
+  "appId": "1:349498828159:web:2b5370673b0937c8d5664a",
+  "apiKey": "AIzaSyCrbqoKBfY7kk7pRIPjMnraAe0OhGv_a2Q",
+  "authDomain": "ai-studio-applet-webapp-325b1.firebaseapp.com",
+  "firestoreDatabaseId": "ai-studio-americanroyalero-9f596277-efe9-4464-8e04-1f4f5c38c132",
+  "storageBucket": "ai-studio-applet-webapp-325b1.firebasestorage.app",
+  "messagingSenderId": "349498828159",
+  "measurementId": "",
+  "oAuthClientId": "349498828159-3vcln3dk4s6jm3q4b3di2uciu9rcs3c3.apps.googleusercontent.com",
+  "recaptchaSiteKey": ""
+}

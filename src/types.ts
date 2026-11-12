@@ -93,6 +93,8 @@ export interface TrialRecord {
   counterStreakBet?: boolean;
   wagerProportion?: number;
   isTest?: boolean;
+  isSimulated?: boolean;
+  is_simulated?: boolean;
   timestamp: string;
   roundNumber?: number;
 }
@@ -122,6 +124,8 @@ export interface OrganizedPlayerSummary {
   assignedX?: number;
   primaryX?: number;
   xConditionsPlayed?: number[];
+  isSimulated?: boolean;
+  is_simulated?: boolean;
   trials: TrialRecord[];
 }
 

@@ -2,60 +2,116 @@
   "entities": {
     "Player": {
       "title": "Player",
-      "description": "Represents a user in the roulette game",
+      "description": "A study participant or manager player profile",
       "type": "object",
       "properties": {
-        "uid": { "type": "string" },
-        "email": { "type": "string" },
-        "chips": { "type": "number", "description": "Virtual currency balance" },
-        "lastActive": { "type": "string", "format": "date-time" },
-        "isManager": { "type": "boolean" }
+        "uid": { "type": "string", "description": "Unique identifier for the player session" },
+        "name": { "type": "string", "description": "Participant nickname or Subject ID" },
+        "email": { "type": "string", "description": "Optional email identifier" },
+        "chips": { "type": "number", "description": "Current chip/points balance" },
+        "finalPt": { "type": "number", "description": "Final balance recorded on session conclusion" },
+        "totalBets": { "type": "number", "description": "Total number of bets placed" },
+        "assignedX": { "type": "number", "description": "Assigned fair condition X parameter" },
+        "isManager": { "type": "boolean", "description": "Whether the user is manager" },
+        "hasLeft": { "type": "boolean", "description": "Whether the player concluded and left the game" },
+        "leftReason": { "type": "string", "description": "Reason for leaving: bankrupt or voluntarily_left" },
+        "registeredAt": { "type": "string", "description": "Registration ISO timestamp" },
+        "lastActive": { "type": "string", "description": "Last active ISO timestamp" }
       },
-      "required": ["uid", "email", "chips"]
-    },
-    "GameResult": {
-      "title": "Game Result",
-      "description": "Record of a single spin result",
-      "type": "object",
-      "properties": {
-        "gameId": { "type": "string" },
-        "winningNumber": { "type": "string" },
-        "winningColor": { "type": "string" },
-        "timestamp": { "type": "string", "format": "date-time" }
-      },
-      "required": ["winningNumber", "winningColor", "timestamp"]
+      "required": ["uid", "name", "chips", "isManager"]
     },
     "Bet": {
       "title": "Bet",
-      "description": "A bet placed by a player in a specific game",
+      "description": "A roulette trial bet record placed by a player",
       "type": "object",
       "properties": {
-        "betId": { "type": "string" },
-        "playerId": { "type": "string" },
-        "playerEmail": { "type": "string" },
-        "gameId": { "type": "string" },
-        "betType": { "type": "string" },
-        "betValue": { "type": "string", "description": "e.g. 'Red', 'Even', '17', '1st 12'" },
-        "amount": { "type": "number" },
-        "payout": { "type": "number" },
-        "status": { "type": "string", "enum": ["pending", "won", "lost"] },
-        "timestamp": { "type": "string", "format": "date-time" }
+        "id": { "type": "string", "description": "Unique bet identifier" },
+        "playerUid": { "type": "string", "description": "UID of the player who placed the bet" },
+        "playerName": { "type": "string", "description": "Nickname of the player" },
+        "playerEmail": { "type": "string", "description": "Optional email of the player" },
+        "amount": { "type": "number", "description": "Wager amount" },
+        "type": { "type": "string", "description": "Bet type e.g. color" },
+        "value": { "type": "string", "description": "Chosen bet value e.g. Red or Black" },
+        "winningNumber": { "type": "string", "description": "Roulette outcome number" },
+        "winningColor": { "type": "string", "description": "Roulette outcome color" },
+        "payout": { "type": "number", "description": "Payout amount awarded" },
+        "status": { "type": "string", "description": "Outcome status: won or lost" },
+        "balanceAfter": { "type": "number", "description": "Player balance after spin resolution" },
+        "paramX": { "type": "number", "description": "Condition X parameter at the time of the trial" },
+        "streakLength": { "type": "number", "description": "Current color streak length" },
+        "counterStreakBet": { "type": "boolean", "description": "Whether the player bet against the streak" },
+        "wagerProportion": { "type": "number", "description": "Wager proportion relative to bankroll" },
+        "isTest": { "type": "boolean", "description": "Whether this wager was made in manager test mode" },
+        "timestamp": { "type": "string", "description": "ISO timestamp of the trial" }
       },
-      "required": ["playerId", "amount", "betType", "betValue", "status", "timestamp"]
+      "required": ["id", "playerUid", "playerName", "amount", "value", "status"]
+    },
+    "Game": {
+      "title": "Game",
+      "description": "Historical roulette wheel spin outcome",
+      "type": "object",
+      "properties": {
+        "winningNumber": { "type": "string", "description": "Drawn number" },
+        "winningColor": { "type": "string", "description": "Drawn color (red, black, green)" },
+        "timestamp": { "type": "string", "description": "Outcome ISO timestamp" }
+      },
+      "required": ["winningNumber", "winningColor"]
+    },
+    "SyntheticTrial": {
+      "title": "SyntheticTrial",
+      "description": "Standardized Gambler's Fallacy simulated trial record",
+      "type": "object",
+      "properties": {
+        "user_id": { "type": "string", "description": "Simulated participant ID" },
+        "condition_x": { "type": "number", "description": "Condition X parameter (0, 5, 10, or 15)" },
+        "round_number": { "type": "number", "description": "Sequential trial round" },
+        "bet_amount": { "type": "number", "description": "Bet amount placed" },
+        "streak_count": { "type": "number", "description": "Streak count prior to spin" },
+        "spin_outcome": { "type": "string", "description": "Spin outcome: Win or Loss" },
+        "bet_ratio_change": { "type": "number", "description": "Relative bet size change" },
+        "balance_after": { "type": "number", "description": "Bankroll balance after outcome" },
+        "is_simulated": { "type": "boolean", "description": "Flag identifying record as synthetic" }
+      },
+      "required": ["user_id", "condition_x", "round_number", "bet_amount", "streak_count", "spin_outcome", "is_simulated"]
+    },
+    "SyntheticParticipant": {
+      "title": "SyntheticParticipant",
+      "description": "Simulated participant profile summary",
+      "type": "object",
+      "properties": {
+        "user_id": { "type": "string", "description": "Simulated participant ID" },
+        "condition_x": { "type": "number", "description": "Condition X parameter" },
+        "initial_balance": { "type": "number", "description": "Initial balance" },
+        "final_balance": { "type": "number", "description": "Final balance" },
+        "total_rounds": { "type": "number", "description": "Total rounds completed" },
+        "bankrupt": { "type": "boolean", "description": "Whether participant went bankrupt" },
+        "max_bet": { "type": "number", "description": "Maximum bet amount" },
+        "avg_bet": { "type": "number", "description": "Average bet amount" },
+        "is_simulated": { "type": "boolean", "description": "Flag identifying profile as synthetic" }
+      },
+      "required": ["user_id", "condition_x", "is_simulated"]
     }
   },
   "firestore": {
-    "/players/{uid}": {
-      "schema": "Player",
-      "description": "User profiles and chip balances"
-    },
-    "/games/{gameId}": {
-      "schema": "GameResult",
-      "description": "History of all roulette spins"
+    "/players/{playerId}": {
+      "schema": { "$ref": "#/entities/Player" },
+      "description": "Public participant leaderboard profiles and manager records"
     },
     "/bets/{betId}": {
-      "schema": "Bet",
-      "description": "All bets placed by all players"
+      "schema": { "$ref": "#/entities/Bet" },
+      "description": "All trial records generated by participants and manager testing"
+    },
+    "/games/{gameId}": {
+      "schema": { "$ref": "#/entities/Game" },
+      "description": "Recent wheel spin history"
+    },
+    "/synthetic_trials/{id}": {
+      "schema": { "$ref": "#/entities/SyntheticTrial" },
+      "description": "Simulated trials for Gambler's Fallacy research"
+    },
+    "/synthetic_participants/{id}": {
+      "schema": { "$ref": "#/entities/SyntheticParticipant" },
+      "description": "Simulated participant cohorts"
     }
   }
 }

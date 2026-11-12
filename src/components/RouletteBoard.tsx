@@ -119,28 +119,14 @@ export default function RouletteBoard({
             </p>
           </div>
 
-          <div className="pt-2 sm:pt-3 border-t border-red-900/60 space-y-1.5">
-            <div className="flex items-center justify-between">
-              <span className="text-[8px] sm:text-[9px] uppercase font-bold text-red-300/70 tracking-wider">
-                {t("board.allocated")}
-              </span>
-              <div className="text-sm sm:text-base font-mono font-black text-white flex items-center gap-1">
-                <Coins className="w-3.5 h-3.5 text-amber-400 inline" />
-                <span>{redBet > 0 ? `${redBet} PT` : "0 PT"}</span>
-              </div>
+          <div className="pt-2 sm:pt-3 border-t border-red-900/60 flex items-center justify-between">
+            <span className="text-[8px] sm:text-[9px] uppercase font-bold text-red-300/70 tracking-wider">
+              {t("board.allocated")}
+            </span>
+            <div className="text-sm sm:text-base font-mono font-black text-white flex items-center gap-1">
+              <Coins className="w-3.5 h-3.5 text-amber-400 inline" />
+              <span>{redBet > 0 ? `${redBet} PT` : "0 PT"}</span>
             </div>
-
-            <button
-              type="button"
-              disabled={disabled}
-              onClick={(e) => {
-                e.stopPropagation();
-                if (!disabled) onPlaceBet("color", "Red", selectedChip);
-              }}
-              className="w-full py-2 bg-red-600 hover:bg-red-500 text-white rounded-lg text-[11px] sm:text-xs font-black uppercase tracking-wider transition-transform active:scale-95 shadow-md shadow-red-950/60"
-            >
-              +{selectedChip} PT
-            </button>
           </div>
         </div>
 
@@ -175,28 +161,14 @@ export default function RouletteBoard({
             </p>
           </div>
 
-          <div className="pt-2 sm:pt-3 border-t border-slate-800/80 space-y-1.5">
-            <div className="flex items-center justify-between">
-              <span className="text-[8px] sm:text-[9px] uppercase font-bold text-slate-400 tracking-wider">
-                {t("board.allocated")}
-              </span>
-              <div className="text-sm sm:text-base font-mono font-black text-white flex items-center gap-1">
-                <Coins className="w-3.5 h-3.5 text-amber-400 inline" />
-                <span>{blackBet > 0 ? `${blackBet} PT` : "0 PT"}</span>
-              </div>
+          <div className="pt-2 sm:pt-3 border-t border-slate-800/80 flex items-center justify-between">
+            <span className="text-[8px] sm:text-[9px] uppercase font-bold text-slate-400 tracking-wider">
+              {t("board.allocated")}
+            </span>
+            <div className="text-sm sm:text-base font-mono font-black text-white flex items-center gap-1">
+              <Coins className="w-3.5 h-3.5 text-amber-400 inline" />
+              <span>{blackBet > 0 ? `${blackBet} PT` : "0 PT"}</span>
             </div>
-
-            <button
-              type="button"
-              disabled={disabled}
-              onClick={(e) => {
-                e.stopPropagation();
-                if (!disabled) onPlaceBet("color", "Black", selectedChip);
-              }}
-              className="w-full py-2 bg-slate-800 hover:bg-slate-700 border border-slate-600 text-white rounded-lg text-[11px] sm:text-xs font-black uppercase tracking-wider transition-transform active:scale-95 shadow-md shadow-black/60"
-            >
-              +{selectedChip} PT
-            </button>
           </div>
         </div>
       </div>

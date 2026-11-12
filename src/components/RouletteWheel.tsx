@@ -12,29 +12,39 @@ interface RouletteWheelProps {
 
 export default function RouletteWheel({ isSpinning, winningIndex, onSpinComplete }: RouletteWheelProps) {
   const controls = useAnimation();
-  const [rotation, setRotation] = useState(0);
+  const rotationRef = useRef(0);
+  const onSpinCompleteRef = useRef(onSpinComplete);
+
+  useEffect(() => {
+    onSpinCompleteRef.current = onSpinComplete;
+  }, [onSpinComplete]);
 
   useEffect(() => {
     if (isSpinning && winningIndex !== null) {
       const segmentAngle = 360 / WHEEL_SLOTS.length;
-      // American Wheel: index 0 is "0", index 1 is "28", etc.
-      // Rotation should land the ball on the segment.
-      // The arrow is at the top (0 degrees).
-      // If we want index i to be at the top, we need to rotate by -i * segmentAngle.
-      // Total spin: current rotation + some full turns + offset to winning segment.
       
-      const fullSpins = 5 + Math.random() * 5; // 5 to 10 spins
-      const targetRotation = rotation + (fullSpins * 360) + (360 - (winningIndex * segmentAngle));
+      // Target angle (modulo 360) so that winningIndex lands precisely at the top (12 o'clock pointer)
+      const targetMod = (360 - ((winningIndex * segmentAngle) % 360)) % 360;
+      const currentMod = ((rotationRef.current % 360) + 360) % 360;
+      
+      let forwardDelta = targetMod - currentMod;
+      if (forwardDelta <= 0) {
+        forwardDelta += 360;
+      }
+      
+      // 5 to 8 full integer spins ensures continuous clockwise rotation without fractional drift
+      const fullSpins = 5 + Math.floor(Math.random() * 4);
+      const targetRotation = rotationRef.current + (fullSpins * 360) + forwardDelta;
       
       controls.start({
         rotate: targetRotation,
         transition: {
-          duration: 6,
-          ease: [0.15, 0, 0.15, 1], // Smooth deceleration
+          duration: 5.5,
+          ease: [0.15, 0, 0.15, 1], // Realistic smooth wheel deceleration
         },
       }).then(() => {
-        setRotation(targetRotation % 360);
-        onSpinComplete();
+        rotationRef.current = targetRotation;
+        onSpinCompleteRef.current();
       });
     }
   }, [isSpinning, winningIndex]);
@@ -92,9 +102,14 @@ export default function RouletteWheel({ isSpinning, winningIndex, onSpinComplete
         </svg>
       </motion.div>
 
-      {/* Static Selection Indicator (Top) */}
-      <div className="absolute top-[0px] sm:top-[2px] left-1/2 -translate-x-1/2 z-30 pointer-events-none">
-        <div className="w-2.5 h-4 sm:w-3.5 sm:h-6 bg-white shadow-xl rounded-b-full border-x border-b border-slate-400" />
+      {/* Static Selection Needle Indicator (Pointing straight down at 12 o'clock segment) */}
+      <div className="absolute -top-1 sm:-top-1.5 left-1/2 -translate-x-1/2 z-30 pointer-events-none flex flex-col items-center">
+        {/* Needle Top Bracket */}
+        <div className="w-3.5 sm:w-5 h-2 bg-gradient-to-r from-amber-400 via-yellow-200 to-amber-500 rounded-t-sm shadow-md border-t border-x border-yellow-100" />
+        {/* Needle Arrow Tip pointing downward */}
+        <div className="w-0 h-0 border-l-[6px] sm:border-l-[8px] border-l-transparent border-r-[6px] sm:border-r-[8px] border-r-transparent border-t-[12px] sm:border-t-[16px] border-t-amber-400 drop-shadow-[0_2px_4px_rgba(0,0,0,0.85)] filter -mt-[1px]" />
+        {/* Center Glow Dot */}
+        <div className="w-1.5 h-1.5 rounded-full bg-white shadow-[0_0_6px_rgba(255,255,255,1)] -mt-4 sm:-mt-5 z-40" />
       </div>
 
       {/* Center Hub: Corporate Style */}

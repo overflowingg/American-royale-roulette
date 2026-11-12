@@ -1,6 +1,16 @@
 import React, { useState, useEffect, useCallback } from "react";
 import { onAuthStateChanged, User } from "firebase/auth";
-import { auth, signIn, signOut, ensurePlayer, updateChips, recordBet, recordGameResult, PlayerData, isFirebaseConfigured } from "./lib/firebase";
+import {
+  savePlayerToCloud,
+  recordBetToCloud,
+  recordGameResultToCloud,
+  subscribeToAllPlayers,
+  PlayerData,
+  isFirebaseConfigured,
+  auth,
+  signOut,
+  ensurePlayer
+} from "./lib/firebase";
 import { getSocket, emitBet, emitGameResult, emitPlayerUpdate } from "./lib/realtime";
 import { INITIAL_CHIPS, WHEEL_SLOTS, BET_PAYOUTS, RED_NUMBERS, BLACK_NUMBERS } from "./constants";
 import { Bet, BetType, GameState, RouletteSlot, AppConfig, LeaderboardPlayer } from "./types";
@@ -11,16 +21,17 @@ import LeaderboardTop5 from "./components/LeaderboardTop5";
 import LanguageToggle from "./components/LanguageToggle";
 import ParticipantModal from "./components/ParticipantModal";
 import { useLanguage } from "./lib/i18n";
-import { Coins, LogOut, History, Info, BarChart3, RotateCw, AlertTriangle, UserCheck, ShieldCheck, FlaskConical, X, Trophy } from "lucide-react";
+import { Coins, LogOut, History, Info, BarChart3, RotateCw, AlertTriangle, UserCheck, ShieldCheck, FlaskConical, X, Trophy, TrendingUp, FileSpreadsheet } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
 import { cn } from "./lib/utils";
 
 export default function App() {
-  const { t, translateBetValue } = useLanguage();
+  const { t, language, translateBetValue } = useLanguage();
   const [user, setUser] = useState<User | null>(null);
   const [player, setPlayer] = useState<PlayerData | null>(null);
   const [config, setConfig] = useState<AppConfig | null>(null);
   const [view, setView] = useState<"game" | "manager">("game");
+  const [managerConsoleTab, setManagerConsoleTab] = useState<"analytics" | "participants">("analytics");
   const [onlineCount, setOnlineCount] = useState(1);
   const [globalBets, setGlobalBets] = useState<any[]>([]);
   const [globalHistory, setGlobalHistory] = useState<any[]>([]);
@@ -70,7 +81,7 @@ export default function App() {
   const [participantTrials, setParticipantTrials] = useState<number>(0);
 
   // Participant identification states (Unique name per participant; Manager ID: "manager" / PW: "123456")
-  const [showParticipantModal, setShowParticipantModal] = useState<boolean>(false);
+  const [showParticipantModal, setShowParticipantModal] = useState<boolean>(true);
   const [participantName, setParticipantName] = useState<string>(() => {
     return localStorage.getItem("vantage_participant_name") || "";
   });
@@ -83,21 +94,18 @@ export default function App() {
     participantName.trim().toLowerCase() === "manager"
   );
 
-  // Verify and ensure unique participant identification on startup
+  // Verify and ensure participant identification on startup - everyone sees the login page first
   useEffect(() => {
     const storedName = localStorage.getItem("vantage_participant_name");
     const storedUid = localStorage.getItem("vantage_participant_uid");
 
-    if (!storedName) {
-      // Must name themselves first before starting
-      setShowParticipantModal(true);
-    } else {
+    // Always display participant modal on initial visit / link open
+    setShowParticipantModal(true);
+
+    if (storedName) {
       const isStoredManager = storedName.trim().toLowerCase() === "manager";
-      if (isStoredManager) {
-        // Manager requires re-verifying password if not already validated
-        setShowParticipantModal(true);
-      } else {
-        // Verify and sync participant session with server on startup/reload
+      if (!isStoredManager) {
+        // Pre-fetch participant state to show active balance & trial status in modal
         fetch("/api/players/register", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -108,40 +116,30 @@ export default function App() {
             return r.ok && ct.includes("application/json") ? r.json() : null;
           })
           .then((res) => {
-            if (!res) return;
-            if (
-              res.success &&
-              res.player &&
-              !res.player.hasLeft &&
-              (res.player.chips > 0 || res.player.isManager)
-            ) {
-              setPlayer(res.player);
-              setParticipantName(res.player.name);
-              setParticipantUid(res.player.uid);
-              if (typeof res.player.assignedX === "number") {
-                setFairRoundsX(res.player.assignedX);
-                localStorage.setItem("vantage_fair_x", String(res.player.assignedX));
+            if (res && res.success && res.player) {
+              if (!res.player.hasLeft && (res.player.chips > 0 || res.player.isManager)) {
+                setPlayer(res.player);
+                setParticipantName(res.player.name);
+                setParticipantUid(res.player.uid);
+                if (typeof res.player.assignedX === "number") {
+                  setFairRoundsX(res.player.assignedX);
+                  localStorage.setItem("vantage_fair_x", String(res.player.assignedX));
+                }
+                setGameState((prev) => ({
+                  ...prev,
+                  balance: res.player.chips ?? prev.balance,
+                }));
+                setParticipantTrials(res.player.totalBets || 0);
+              } else {
+                localStorage.removeItem("vantage_participant_name");
+                localStorage.removeItem("vantage_participant_uid");
+                setParticipantName("");
+                setParticipantUid("");
+                setPlayer(null);
               }
-              setGameState((prev) => ({
-                ...prev,
-                balance: res.player.chips ?? prev.balance,
-              }));
-              setParticipantTrials(res.player.totalBets || 0);
-              setShowParticipantModal(false);
-              emitPlayerUpdate(res.player);
-            } else {
-              // Session is permanently concluded or chips depleted: clear credentials so participant cannot continue
-              localStorage.removeItem("vantage_participant_name");
-              localStorage.removeItem("vantage_participant_uid");
-              setParticipantName("");
-              setParticipantUid("");
-              setPlayer(null);
-              setShowParticipantModal(true);
             }
           })
-          .catch(() => {
-            setShowParticipantModal(true);
-          });
+          .catch(() => {});
       }
     }
   }, []);
@@ -173,8 +171,14 @@ export default function App() {
     setShowParticipantModal(false);
     emitPlayerUpdate(fullPlayer);
 
-    // If manager logs in, open game view directly so they can test
+    if (isFirebaseConfigured) {
+      savePlayerToCloud(fullPlayer);
+    }
+
+    // If manager logs in, open manager dashboard directly
     if (isManagerUser) {
+      setView("manager");
+    } else {
       setView("game");
     }
   };
@@ -246,7 +250,8 @@ export default function App() {
     });
 
     socket.on("leaderboard_update", (top5: LeaderboardPlayer[]) => {
-      if (Array.isArray(top5)) {
+      // If Firebase is configured, Cloud Firestore real-time onSnapshot is the single source of truth
+      if (!isFirebaseConfigured && Array.isArray(top5)) {
         setLeaderboard(top5);
       }
     });
@@ -261,7 +266,38 @@ export default function App() {
       }
     });
 
+    // Cloud Database real-time listener: syncs multi-user leaderboards across all shared links
+    let unsubCloud: (() => void) | undefined;
+    if (isFirebaseConfigured) {
+      unsubCloud = subscribeToAllPlayers((cloudPlayers) => {
+        // Fetch ALL registered users (excluding only manager), strictly ranked by balance descending
+        // Ensure 0-balance users (bankrupt) are NOT excluded
+        const validParticipants = cloudPlayers
+          .filter((p) => !p.isManager && p.uid !== "manager_root" && p.name.trim().toLowerCase() !== "manager")
+          .sort((a, b) => {
+            const ptA = typeof a.finalPt === "number" ? a.finalPt : a.chips;
+            const ptB = typeof b.finalPt === "number" ? b.finalPt : b.chips;
+            if (ptB !== ptA) return ptB - ptA;
+            return (b.totalBets || 0) - (a.totalBets || 0);
+          })
+          .slice(0, 3)
+          .map((p, idx) => ({
+            rank: idx + 1,
+            uid: p.uid,
+            name: p.name,
+            chips: typeof p.finalPt === "number" ? p.finalPt : (p.chips ?? 0),
+            finalPt: typeof p.finalPt === "number" ? p.finalPt : (p.chips ?? 0),
+            totalBets: p.totalBets || 0,
+            assignedX: p.assignedX,
+            hasLeft: Boolean(p.hasLeft),
+            lastActive: p.lastActive,
+          }));
+        setLeaderboard(validParticipants);
+      });
+    }
+
     return () => {
+      if (unsubCloud) unsubCloud();
       socket.off("status_update");
       socket.off("new_game_result");
       socket.off("new_bet");
@@ -308,25 +344,19 @@ export default function App() {
     const isTestBet = isManager;
 
     setGameState((prev) => {
-      const existing = prev.pendingBets.find((b) => b.value.toLowerCase() === value.toLowerCase());
-      let newBets: Bet[];
-      if (existing) {
-        newBets = prev.pendingBets.map((b) =>
-          b.value.toLowerCase() === value.toLowerCase() ? { ...b, amount: b.amount + betAmount } : b
-        );
-      } else {
-        newBets = [
-          ...prev.pendingBets,
-          {
-            id: Math.random().toString(36).slice(2, 10),
-            type,
-            value,
-            amount: betAmount,
-            chipColor: value === "Red" ? "bg-red-500 text-white" : "bg-slate-900 border border-slate-600 text-white",
-            isTest: isTestBet,
-          },
-        ];
-      }
+      // In this single-color study protocol, each trial consists of exactly one color bet (Red or Black).
+      // Selecting a color assigns that exact amount to that color.
+      // NOTE: Balance is NOT deducted upfront. The previous settled balance is maintained
+      // throughout the betting phase and the entire wheel spinning animation.
+      // Settlement occurs exclusively after the wheel finishes spinning in handleSpinComplete.
+      const newColorBet: Bet = {
+        id: Math.random().toString(36).slice(2, 10),
+        type: "color",
+        value,
+        amount: betAmount,
+        chipColor: value === "Red" ? "bg-red-500 text-white" : "bg-slate-900 border border-slate-600 text-white",
+        isTest: isTestBet,
+      };
 
       // Emit bet for global visibility
       emitBet({
@@ -334,7 +364,7 @@ export default function App() {
         playerName: player?.name || participantName,
         playerEmail: player?.email || (isTestBet ? "manager@vantage.admin" : `${participantName}@study.subject`),
         amount: betAmount,
-        type,
+        type: "color",
         value,
         isTest: isTestBet,
         timestamp: new Date().toISOString(),
@@ -342,10 +372,20 @@ export default function App() {
 
       return {
         ...prev,
-        balance: prev.balance - betAmount,
-        pendingBets: newBets,
+        // Strictly maintain previous balance during betting:
+        balance: prev.balance,
+        // Strictly 1 single pending bet to avoid multi-deductions or phantom bets:
+        pendingBets: [newColorBet],
       };
     });
+  };
+
+  const clearBets = () => {
+    if (gameState.isSpinning) return;
+    setGameState((prev) => ({
+      ...prev,
+      pendingBets: [],
+    }));
   };
 
   const handleSpin = () => {
@@ -355,19 +395,13 @@ export default function App() {
       return;
     }
 
-    // Check if within initial X fair rounds (50% winning chance)
-    const isWithinFairWindow = !isManager && participantTrials < fairRoundsX;
-    let index: number;
-
-    if (isWithinFairWindow) {
-      // 50% Fair probability: select strictly among the 36 Red and Black slots (0 and 00 excluded, exactly 50/50)
-      const fairSlots = WHEEL_SLOTS.filter((s) => s.color === "red" || s.color === "black");
-      const chosen = fairSlots[Math.floor(Math.random() * fairSlots.length)];
-      index = chosen.index;
-    } else {
-      // Full American Roulette: 38 slots including 0 and 00 (house edge / unfair active)
-      index = Math.floor(Math.random() * WHEEL_SLOTS.length);
+    const currentBet = gameState.pendingBets[0];
+    if (!currentBet || gameState.balance < currentBet.amount) {
+      return;
     }
+
+    // With 0 assigned to Red and 00 assigned to Black, all 38 slots are Red (19) or Black (19) with exactly 50% probability
+    const index = Math.floor(Math.random() * WHEEL_SLOTS.length);
 
     setWinningIndex(index);
     setGameState((prev) => ({ ...prev, isSpinning: true }));
@@ -380,45 +414,46 @@ export default function App() {
     const winningNum = result.number;
     const winningColor = result.color;
 
-    // Calculate payouts
-    let totalPayout = 0;
-    const processedBets = gameState.pendingBets.map((bet) => {
+    // Retrieve active pending bet (in this single-color protocol, strictly 1 bet)
+    const activeBets = gameState.pendingBets;
+    if (activeBets.length === 0) {
+      setGameState((prev) => ({ ...prev, isSpinning: false }));
+      setWinningIndex(null);
+      return;
+    }
+
+    // Settlement calculation:
+    // Strictly: with a $50 bet, winning adds $50 and losing deducts $50.
+    // Ensure no multi-deductions, repeated deductions, or incorrect multiplier bugs.
+    let netProfit = 0;
+    const processedBets = activeBets.map((bet) => {
       let isWin = false;
-      let multiplier = 1;
+      const betVal = (bet.value || "").toLowerCase();
+      const winCol = (winningColor || "").toLowerCase();
 
-      if (bet.value === "Red" && winningColor === "red") {
+      if (betVal === "red" && winCol === "red") {
         isWin = true;
-        multiplier = 1; // 1:1 payout
-      } else if (bet.value === "Black" && winningColor === "black") {
+      } else if (betVal === "black" && winCol === "black") {
         isWin = true;
-        multiplier = 1; // 1:1 payout
-      } else if (bet.value === "Green" && winningColor === "green") {
+      } else if (betVal === "green" && winCol === "green") {
         isWin = true;
-        multiplier = 17; // 17:1 payout for green zeros
+      } else if (bet.type === "straight" && betVal === winningNum.toLowerCase()) {
+        isWin = true;
+      }
+
+      if (isWin) {
+        netProfit += bet.amount; // Winning strictly adds bet amount (+50 for $50 bet)
       } else {
-        multiplier = BET_PAYOUTS[bet.type] || 1;
+        netProfit -= bet.amount; // Losing strictly deducts bet amount (-50 for $50 bet)
       }
 
-      const payout = isWin ? bet.amount * (multiplier + 1) : 0;
-      totalPayout += payout;
-
-      // Persistence: Record bet in Firebase if configured
-      if (isFirebaseConfigured && user) {
-        recordBet({
-          playerId: user.uid,
-          playerEmail: user.email,
-          betType: bet.type,
-          betValue: bet.value,
-          amount: bet.amount,
-          payout,
-          status: isWin ? "won" : "lost",
-        });
-      }
-
-      return { ...bet, status: isWin ? "won" : "lost", payout };
+      // For research metrics & analytics: payout is returned stake + profit on win (2 * bet.amount), 0 on loss
+      const payout = isWin ? bet.amount * 2 : 0;
+      return { ...bet, status: isWin ? ("won" as const) : ("lost" as const), payout };
     });
 
-    const newBalance = gameState.balance + totalPayout;
+    const previousBalance = gameState.balance;
+    const newBalance = Math.max(0, previousBalance + netProfit);
     const isTestRun = isManager;
 
     // Calculate current streak length S and directional counter-betting
@@ -435,47 +470,55 @@ export default function App() {
       }
     }
 
-    const totalWageredOnSpin = gameState.pendingBets.reduce((sum, b) => sum + b.amount, 0);
-    const bankrollBeforeSpin = gameState.balance + totalWageredOnSpin;
+    const totalWageredOnSpin = activeBets.reduce((sum, b) => sum + b.amount, 0);
+    const bankrollBeforeSpin = previousBalance;
+    const wagerProportion =
+      bankrollBeforeSpin > 0 ? Number((totalWageredOnSpin / bankrollBeforeSpin).toFixed(3)) : 0.1;
 
-    // Study Data Recording: Record every trial to server storage
-    // Flag manager testing wagers so they DO NOT effect or contaminate the study data
+    // Study Data Recording: Record every trial to Cloud Firestore and server storage
     processedBets.forEach((bet) => {
       const isCounterStreak = lastColor
         ? (lastColor === "black" && bet.value.toLowerCase() === "red") ||
           (lastColor === "red" && bet.value.toLowerCase() === "black")
         : false;
-      const wagerProportion =
-        bankrollBeforeSpin > 0 ? Number((bet.amount / bankrollBeforeSpin).toFixed(3)) : 0.1;
 
+      const betPayload = {
+        id: Math.random().toString(36).substring(2, 11),
+        playerUid: player?.uid || participantUid || (isTestRun ? "manager_root" : "sub_participant"),
+        playerName: player?.name || participantName || (isTestRun ? "manager" : "Anonymous Participant"),
+        playerEmail: player?.email || (isTestRun ? "manager@vantage.admin" : `${participantName}@study.subject`),
+        amount: bet.amount,
+        type: bet.type,
+        value: bet.value,
+        winningNumber: winningNum,
+        winningColor: winningColor,
+        payout: bet.payout,
+        status: bet.status,
+        balanceAfter: newBalance,
+        paramX: !isTestRun && typeof player?.assignedX === "number" ? player.assignedX : fairRoundsX,
+        streakLength: currentStreak,
+        counterStreakBet: isCounterStreak,
+        wagerProportion,
+        isTest: isTestRun,
+        timestamp: new Date().toISOString(),
+      };
+
+      // Real-time Cloud Database: save directly to Firebase Firestore
+      if (isFirebaseConfigured) {
+        recordBetToCloud(betPayload);
+      }
+
+      // Also dispatch to server
       fetch("/api/bets/record", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          playerUid: player?.uid || participantUid || (isTestRun ? "manager_root" : "sub_participant"),
-          playerName: player?.name || participantName || (isTestRun ? "manager" : "Anonymous Participant"),
-          playerEmail: player?.email || (isTestRun ? "manager@vantage.admin" : `${participantName}@study.subject`),
-          amount: bet.amount,
-          type: bet.type,
-          value: bet.value,
-          winningNumber: winningNum,
-          winningColor: winningColor,
-          payout: bet.payout,
-          status: bet.status,
-          balanceAfter: newBalance,
-          paramX: !isTestRun && typeof player?.assignedX === "number" ? player.assignedX : fairRoundsX,
-          streakLength: currentStreak,
-          counterStreakBet: isCounterStreak,
-          wagerProportion,
-          isTest: isTestRun,
-          timestamp: new Date().toISOString(),
-        }),
+        body: JSON.stringify(betPayload),
       }).catch((err) => console.error("Error recording trial:", err));
     });
 
-    // Record game result for history
-    if (isFirebaseConfigured && user) {
-      recordGameResult({
+    // Record game result in Cloud Firestore
+    if (isFirebaseConfigured) {
+      recordGameResultToCloud({
         winningNumber: result.number,
         winningColor: result.color,
       });
@@ -487,19 +530,65 @@ export default function App() {
       timestamp: new Date().toISOString(),
     });
 
-    // Sync player chips back to database
-    if (isFirebaseConfigured && user) {
-      updateChips(user.uid, newBalance);
-    }
+    // 1. Update local game state (Top balance updates at this exact settlement time!)
+    setGameState((prev) => ({
+      ...prev,
+      balance: newBalance,
+      isSpinning: false,
+      lastResult: result,
+      history: [result, ...prev.history].slice(0, 10),
+      pendingBets: [],
+    }));
 
+    // 2. Synchronize leaderboard balance simultaneously at settlement time!
+    setLeaderboard((prev) =>
+      prev.map((item) => {
+        const isCurrent =
+          (player?.uid && item.uid === player.uid) ||
+          (participantUid && item.uid === participantUid) ||
+          (participantName && item.name.toLowerCase() === participantName.trim().toLowerCase());
+        if (isCurrent) {
+          return {
+            ...item,
+            chips: newBalance,
+            finalPt: newBalance,
+            totalBets: (item.totalBets || 0) + 1,
+          };
+        }
+        return item;
+      })
+    );
+
+    // 3. Update player profile state and emit to cloud & server
     if (player) {
-      const updatedPlayer = { ...player, chips: newBalance };
+      const updatedPlayer: PlayerData = {
+        ...player,
+        chips: newBalance,
+        finalPt: newBalance,
+        totalBets: (player.totalBets || 0) + 1,
+        lastActive: new Date().toISOString(),
+      };
       setPlayer(updatedPlayer);
+
+      // Sync player chips back to Cloud Firestore
+      if (isFirebaseConfigured) {
+        savePlayerToCloud(updatedPlayer);
+      }
       emitPlayerUpdate(updatedPlayer);
     }
 
-    // If player reaches 0 chips, automatically record bankruptcy and conclude session
+    // If player reaches 0 chips, automatically record bankruptcy and conclude session in Cloud & Server
     if (newBalance <= 0 && !isManager && participantUid) {
+      if (isFirebaseConfigured && player) {
+        savePlayerToCloud({
+          ...player,
+          chips: 0,
+          finalPt: 0,
+          hasLeft: true,
+          leftReason: "bankrupt",
+          leftAt: new Date().toISOString(),
+        });
+      }
       fetch("/api/players/leave", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -511,29 +600,9 @@ export default function App() {
       }).catch((err) => console.error("Error reporting bankruptcy to server:", err));
     }
 
-    // Update local state
-    setGameState((prev) => ({
-      ...prev,
-      balance: newBalance,
-      isSpinning: false,
-      lastResult: result,
-      history: [result, ...prev.history].slice(0, 10),
-      pendingBets: [],
-    }));
-
     setParticipantTrials((prev) => prev + 1);
     setWinningIndex(null);
-  }, [winningIndex, gameState.pendingBets, gameState.balance, user, player, participantName, participantUid, isManager]);
-
-  const clearBets = () => {
-    if (gameState.isSpinning) return;
-    const refunded = gameState.pendingBets.reduce((acc, b) => acc + b.amount, 0);
-    setGameState((prev) => ({
-      ...prev,
-      balance: prev.balance + refunded,
-      pendingBets: [],
-    }));
-  };
+  }, [winningIndex, gameState.pendingBets, gameState.balance, gameState.history, player, participantName, participantUid, isManager, fairRoundsX]);
 
   const [showLeaveConfirmModal, setShowLeaveConfirmModal] = useState(false);
 
@@ -560,6 +629,16 @@ export default function App() {
 
   const handleConfirmLeave = async () => {
     if (participantUid && !isManager) {
+      if (isFirebaseConfigured && player) {
+        savePlayerToCloud({
+          ...player,
+          chips: gameState.balance,
+          finalPt: gameState.balance,
+          hasLeft: true,
+          leftReason: gameState.balance <= 0 ? "bankrupt" : "voluntarily_left",
+          leftAt: new Date().toISOString(),
+        });
+      }
       try {
         await fetch("/api/players/leave", {
           method: "POST",
@@ -580,6 +659,16 @@ export default function App() {
 
   const handleGameOverLeave = async () => {
     if (participantUid && !isManager) {
+      if (isFirebaseConfigured && player) {
+        savePlayerToCloud({
+          ...player,
+          chips: 0,
+          finalPt: 0,
+          hasLeft: true,
+          leftReason: "bankrupt",
+          leftAt: new Date().toISOString(),
+        });
+      }
       try {
         await fetch("/api/players/leave", {
           method: "POST",
@@ -861,43 +950,47 @@ export default function App() {
 
       {/* Main Layout */}
       <main className="flex-1 flex relative overflow-hidden">
-        {/* Left / Center Pane: Roulette Game Simulation */}
-        <div
-          className={cn(
-            "flex-1 relative bg-emerald-950/5 flex flex-col items-center p-2 sm:p-5 transition-all duration-500 overflow-y-auto",
-            view === "manager" ? "lg:mr-[450px]" : ""
-          )}
-        >
-          {/* Manager Test Mode Banner */}
-          {isManager && (
-            <div className="w-full max-w-5xl mb-3 sm:mb-4 bg-gradient-to-r from-blue-950/90 via-slate-900 to-blue-950/90 border border-blue-500/40 rounded-2xl p-3 flex flex-col sm:flex-row items-center justify-between gap-2.5 shadow-xl">
-              <div className="flex items-center gap-2.5">
-                <div className="w-8 h-8 rounded-xl bg-blue-500/20 border border-blue-400/40 flex items-center justify-center text-blue-400 font-bold shrink-0">
-                  <FlaskConical className="w-4 h-4" />
-                </div>
-                <div>
-                  <div className="flex items-center gap-2">
-                    <span className="text-xs font-black text-white uppercase tracking-wider">
-                      {t("manager.testModeBadge")} (ID: manager)
-                    </span>
-                    <span className="px-1.5 py-0.2 rounded-full bg-blue-500/20 text-blue-300 text-[8px] font-mono font-bold uppercase tracking-widest border border-blue-400/30">
-                      Isolated Testing
-                    </span>
+        {isManager && view === "manager" ? (
+          <div className="flex-1 flex flex-col bg-slate-900 overflow-hidden relative w-full h-full">
+            <ManagerDashboard initialTab="analytics" onClose={() => setView("game")} />
+          </div>
+        ) : (
+          /* Left / Center Pane: Roulette Game Simulation */
+          <div className="flex-1 relative bg-emerald-950/5 flex flex-col items-center p-2 sm:p-5 transition-all duration-500 overflow-y-auto">
+            {/* Manager Test Mode Banner */}
+            {isManager && (
+              <div className="w-full max-w-5xl mb-3 sm:mb-4 bg-gradient-to-r from-blue-950/90 via-slate-900 to-blue-950/90 border border-blue-500/40 rounded-2xl p-3 flex flex-col md:flex-row items-center justify-between gap-3 shadow-xl">
+                <div className="flex items-center gap-2.5">
+                  <div className="w-8 h-8 rounded-xl bg-blue-500/20 border border-blue-400/40 flex items-center justify-center text-blue-400 font-bold shrink-0">
+                    <FlaskConical className="w-4 h-4" />
                   </div>
-                  <p className="text-[10px] sm:text-[11px] text-blue-200/90 font-medium leading-tight mt-0.5">
-                    {t("manager.testModeNotice")}
-                  </p>
+                  <div>
+                    <div className="flex items-center gap-2">
+                      <span className="text-xs font-black text-white uppercase tracking-wider">
+                        {t("manager.testModeBadge")} (ID: manager)
+                      </span>
+                      <span className="px-1.5 py-0.2 rounded-full bg-blue-500/20 text-blue-300 text-[8px] font-mono font-bold uppercase tracking-widest border border-blue-400/30">
+                        Isolated Testing
+                      </span>
+                    </div>
+                    <p className="text-[10px] sm:text-[11px] text-blue-200/90 font-medium leading-tight mt-0.5">
+                      {t("manager.testModeNotice")}
+                    </p>
+                  </div>
+                </div>
+
+                {/* Direct Console Entry Action Button (Single toggle, no separate data analysis button on top) */}
+                <div className="flex items-center gap-2 shrink-0">
+                  <button
+                    onClick={() => setView("manager")}
+                    className="px-3.5 py-1.5 rounded-xl bg-blue-600 hover:bg-blue-500 text-white font-bold text-xs uppercase tracking-wider shadow-md shadow-blue-950/40 transition-all flex items-center gap-1.5 shrink-0"
+                  >
+                    <BarChart3 className="w-3.5 h-3.5" />
+                    <span>{t("app.managerConsole")}</span>
+                  </button>
                 </div>
               </div>
-              <button
-                onClick={() => setView(view === "manager" ? "game" : "manager")}
-                className="px-3 py-1.5 rounded-xl bg-blue-600 hover:bg-blue-500 text-white font-bold text-xs uppercase tracking-wider shadow-md transition-all flex items-center gap-1.5 shrink-0"
-              >
-                <BarChart3 className="w-3.5 h-3.5" />
-                {view === "manager" ? t("manager.backToTest") : t("manager.organizedDataTitle")}
-              </button>
-            </div>
-          )}
+            )}
 
           {/* Instructions Protocol Top Bar */}
           <div className="w-full max-w-5xl mb-2 sm:mb-4">
@@ -939,6 +1032,9 @@ export default function App() {
                   <li className="flex gap-1.5">
                     <span className="text-emerald-500 font-mono font-bold">04.</span> {t("protocol.step4")}
                   </li>
+                  <li className="flex gap-1.5">
+                    <span className="text-emerald-500 font-mono font-bold">05.</span> {t("protocol.step5")}
+                  </li>
                 </ul>
               )}
             </div>
@@ -956,8 +1052,99 @@ export default function App() {
                   onSpinComplete={handleSpinComplete}
                 />
 
+                {/* Outcome Result Display (Directly below the Roulette Wheel) */}
+                <div className="w-full my-2.5 flex flex-col items-center justify-center">
+                  {gameState.isSpinning ? (
+                    <div className="flex items-center gap-2 px-4 py-1.5 rounded-full bg-amber-500/15 border border-amber-500/40 text-amber-300 font-mono text-xs sm:text-sm font-bold animate-pulse shadow-md">
+                      <RotateCw className="w-3.5 h-3.5 animate-spin" />
+                      <span>{t("probe.spinning")}</span>
+                    </div>
+                  ) : gameState.lastResult ? (
+                    <div className="flex flex-col items-center gap-1.5 animate-in fade-in zoom-in-95 duration-200">
+                      <div
+                        className={cn(
+                          "flex items-center gap-2.5 sm:gap-3.5 px-4 sm:px-6 py-2 sm:py-2.5 rounded-xl border-2 shadow-xl transition-all transform",
+                          gameState.lastResult.color === "red"
+                            ? "bg-gradient-to-r from-red-950/90 via-red-900 to-red-950/90 border-red-500 text-white shadow-red-950/60"
+                            : "bg-gradient-to-r from-slate-950 via-neutral-900 to-slate-950 border-slate-500 text-white shadow-black/80"
+                        )}
+                      >
+                        <span className="text-[10px] sm:text-xs font-bold uppercase tracking-wider opacity-80">
+                          {language === "zh" ? "开奖结果" : "Result"}:
+                        </span>
+                        <div className="flex items-center gap-2">
+                          <span
+                            className={cn(
+                              "w-3.5 h-3.5 rounded-full shadow-md shrink-0",
+                              gameState.lastResult.color === "red"
+                                ? "bg-red-500 shadow-red-500/80"
+                                : "bg-slate-900 border border-slate-400 shadow-slate-900/80"
+                            )}
+                          />
+                          <span className="text-base sm:text-xl font-black font-sans tracking-widest uppercase">
+                            {gameState.lastResult.color === "red"
+                              ? language === "zh"
+                                ? "红 (RED)"
+                                : "RED"
+                              : language === "zh"
+                              ? "黑 (BLACK)"
+                              : "BLACK"}
+                          </span>
+                        </div>
+                        <span
+                          className={cn(
+                            "px-2 py-0.5 rounded font-mono font-black text-xs sm:text-sm shadow-sm",
+                            gameState.lastResult.color === "red"
+                              ? "bg-red-600/80 border border-red-400/50 text-white"
+                              : "bg-slate-800 border border-slate-600 text-slate-100"
+                          )}
+                        >
+                          #{gameState.lastResult.number}
+                        </span>
+                      </div>
+
+                      {/* Recent Historical Sequence */}
+                      {gameState.history.length > 1 && (
+                        <div className="flex items-center gap-1.5 text-[9px] text-slate-400 mt-0.5">
+                          <span className="opacity-70">{language === "zh" ? "历史走势" : "Recent"}:</span>
+                          <div className="flex items-center gap-1">
+                            {gameState.history.slice(0, 6).map((item, idx) => (
+                              <span
+                                key={idx}
+                                className={cn(
+                                  "w-4 h-4 rounded-full flex items-center justify-center text-[8px] font-mono font-bold text-white shadow-xs",
+                                  item.color === "red"
+                                    ? "bg-red-600"
+                                    : "bg-slate-800 border border-slate-600"
+                                )}
+                                title={`#${item.number} ${item.color.toUpperCase()}`}
+                              >
+                                {item.number}
+                              </span>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  ) : (
+                    <div className="flex items-center gap-2 px-3.5 py-1.5 rounded-xl bg-slate-950/60 border border-slate-800 text-slate-400 text-xs font-medium">
+                      <span className="w-2 h-2 rounded-full bg-slate-600 animate-pulse" />
+                      <span>{language === "zh" ? "下注后点击下方按钮开始" : "Place your bet & click spin below"}</span>
+                    </div>
+                  )}
+                </div>
+
                 {/* Spin Action CTA */}
-                <div className="w-full mt-2 sm:mt-3 flex items-center justify-center pt-2 border-t border-slate-800/80">
+                <div className="w-full mt-2 sm:mt-3 flex items-center justify-center pt-2 border-t border-slate-800/80 gap-2">
+                  {gameState.pendingBets.length > 0 && !gameState.isSpinning && (
+                    <button
+                      onClick={clearBets}
+                      className="py-2.5 px-3 rounded-xl bg-slate-800 hover:bg-slate-750 text-slate-300 font-bold text-xs uppercase tracking-wider border border-slate-700 transition-all active:scale-95 touch-manipulation shrink-0"
+                      title={language === "zh" ? "撤销下注" : "Clear Bet"}
+                    >
+                      {language === "zh" ? "撤销" : "Clear"}
+                    </button>
+                  )}
                   <button
                     onClick={handleSpin}
                     disabled={gameState.isSpinning || gameState.pendingBets.length === 0}
@@ -1003,28 +1190,6 @@ export default function App() {
             </div>
           </div>
         </div>
-
-        {/* Right Drawer: Manager Organized Study Data & Analytics */}
-        {isManager && (
-          <aside
-            className={cn(
-              "fixed inset-y-16 right-0 w-full sm:w-[680px] md:w-[780px] lg:w-[880px] xl:w-[980px] z-40 transform transition-transform duration-300 ease-in-out border-l border-slate-800 bg-slate-900 shadow-2xl",
-              view === "manager" ? "translate-x-0" : "translate-x-full"
-            )}
-          >
-            <div className="h-full flex flex-col relative">
-              <button
-                onClick={() => setView("game")}
-                className="absolute top-4 right-4 z-50 p-2 text-slate-400 hover:text-white bg-slate-800 hover:bg-slate-700 rounded-lg border border-slate-700 shadow-sm transition-all"
-                title="Close Manager Console"
-              >
-                <X className="w-4 h-4" />
-              </button>
-              <div className="flex-1 overflow-hidden">
-                <ManagerDashboard />
-              </div>
-            </div>
-          </aside>
         )}
       </main>
 

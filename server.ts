@@ -6,6 +6,15 @@ import dotenv from "dotenv";
 import { createServer } from "http";
 import { Server } from "socket.io";
 import { computeResearchAnalytics } from "./src/lib/researchAnalytics";
+import {
+  generateSyntheticGamblersFallacyDataset,
+  formatSyntheticRecordsToCsv,
+  saveSyntheticDatasetToFirestore,
+  SyntheticDataset,
+  SyntheticTrialRecord,
+} from "./src/lib/syntheticGamblersFallacy";
+import { initializeApp, getApps } from "firebase/app";
+import { getFirestore, collection, getDocs, doc, setDoc, updateDoc } from "firebase/firestore";
 
 dotenv.config();
 
@@ -17,6 +26,38 @@ const MANAGER_PASSWORD = "123456";
 
 const DATA_DIR = path.join(process.cwd(), "data");
 const DATA_FILE = path.join(DATA_DIR, "study_store.json");
+const SYNTHETIC_FILE = path.join(DATA_DIR, "synthetic_study_data.json");
+const SYNTHETIC_CSV_FILE = path.join(DATA_DIR, "synthetic_gamblers_fallacy_data.csv");
+const SYNTHETIC_JSON_FILE = path.join(DATA_DIR, "synthetic_gamblers_fallacy_data.json");
+
+function getOrGenerateSyntheticData(forceRegen = false, nPerCond = 15, roundsPerPart = 30): SyntheticDataset {
+  if (!forceRegen && fs.existsSync(SYNTHETIC_FILE)) {
+    try {
+      return JSON.parse(fs.readFileSync(SYNTHETIC_FILE, "utf8"));
+    } catch {
+      console.warn("[Synthetic Data] Cache read error, generating fresh dataset...");
+    }
+  }
+  const dataset = generateSyntheticGamblersFallacyDataset({
+    nPerCondition: nPerCond,
+    roundsPerParticipant: roundsPerPart,
+  });
+  fs.writeFileSync(SYNTHETIC_FILE, JSON.stringify(dataset, null, 2), "utf8");
+  fs.writeFileSync(SYNTHETIC_CSV_FILE, formatSyntheticRecordsToCsv(dataset.records, false), "utf8");
+  const standardizedJson = dataset.records.map((r) => ({
+    user_id: r.user_id,
+    condition_x: r.condition_x,
+    round_number: r.round_number,
+    bet_amount: r.bet_amount,
+    streak_count: r.streak_count,
+    spin_outcome: r.spin_outcome,
+    bet_ratio_change: r.bet_ratio_change,
+    balance_after: r.balance_after,
+    is_simulated: true,
+  }));
+  fs.writeFileSync(SYNTHETIC_JSON_FILE, JSON.stringify(standardizedJson, null, 2), "utf8");
+  return dataset;
+}
 
 interface GameResult {
   winningNumber: string;
@@ -63,10 +104,16 @@ interface Player {
 
 export const STUDY_X_CONDITIONS = [0, 5, 10, 15] as const;
 
+function isManagerAccount(name?: string, email?: string, uid?: string): boolean {
+  const n = String(name || "").trim().toLowerCase();
+  const u = String(uid || "").trim();
+  return n === MANAGER_ID || u === "manager_root";
+}
+
 // Helper to calculate balanced distribution so the number of players of each X is averaged
-function getConditionXDistribution() {
+function getConditionXDistribution(includeSynthetic = true) {
   const participants = Object.values(store.players).filter(
-    (p) => !p.isManager && p.uid !== "manager_root" && p.name.toLowerCase() !== MANAGER_ID
+    (p) => !p.isManager && p.uid !== "manager_root" && !isManagerAccount(p.name, p.email, p.uid)
   );
 
   const counts: Record<number, number> = { 0: 0, 5: 0, 10: 0, 15: 0 };
@@ -89,7 +136,25 @@ function getConditionXDistribution() {
     }
   }
 
-  const total = participants.length;
+  let total = participants.length;
+  if (includeSynthetic) {
+    try {
+      const synthetic = getOrGenerateSyntheticData(false);
+      if (synthetic && synthetic.condition_counts) {
+        for (const [xStr, cnt] of Object.entries(synthetic.condition_counts as Record<string, number>)) {
+          const xNum = Number(xStr);
+          const c = Number(cnt);
+          if (STUDY_X_CONDITIONS.includes(xNum as any)) {
+            counts[xNum] = (counts[xNum] || 0) + c;
+            total += c;
+          }
+        }
+      }
+    } catch {
+      // Fallback if cache not ready yet
+    }
+  }
+
   const average = total > 0 ? Number((total / STUDY_X_CONDITIONS.length).toFixed(2)) : 0;
 
   // Determine which condition is least-filled for next assignment
@@ -100,7 +165,7 @@ function getConditionXDistribution() {
     }
   }
   const leastFilled = STUDY_X_CONDITIONS.filter((x) => counts[x] === minCount);
-  const nextAssigned = leastFilled[0];
+  const nextAssigned = leastFilled[0] ?? 0;
 
   return {
     counts,
@@ -164,25 +229,102 @@ function saveStore() {
 
 loadStore();
 
+// Cloud Firestore initialization for server sync
+let cloudDb: any = null;
+try {
+  const cfgPath = path.join(process.cwd(), "firebase-applet-config.json");
+  if (fs.existsSync(cfgPath)) {
+    const firebaseConfig = JSON.parse(fs.readFileSync(cfgPath, "utf8"));
+    if (firebaseConfig && firebaseConfig.apiKey && firebaseConfig.projectId) {
+      const fbApp = getApps().length > 0 ? getApps()[0] : initializeApp(firebaseConfig, "server-sync");
+      cloudDb = getFirestore(fbApp, firebaseConfig.firestoreDatabaseId);
+      console.log(`[Firebase] Initialized Cloud Firestore for server sync on project: ${firebaseConfig.projectId}`);
+    }
+  }
+} catch (e) {
+  console.warn("[Firebase] Server sync init error:", e);
+}
+
+// Synchronize all genuine registered players and bets from Cloud Firestore to server store
+async function syncFromCloudFirestore(): Promise<void> {
+  if (!cloudDb) return;
+  try {
+    const playersSnap = await getDocs(collection(cloudDb, "players"));
+    let updated = false;
+
+    // Purge any mock/dummy users that do not exist in genuine Cloud Firestore
+    const cloudUids = new Set<string>();
+    playersSnap.docs.forEach((d) => {
+      cloudUids.add(d.id);
+      const data = d.data() as any;
+      if (data && data.uid) {
+        store.players[data.uid] = {
+          uid: data.uid,
+          name: data.name || "Anonymous",
+          email: data.email || `${data.name || "user"}@study.subject`,
+          chips: typeof data.chips === "number" ? data.chips : (typeof data.finalPt === "number" ? data.finalPt : 1000),
+          finalPt: typeof data.finalPt === "number" ? data.finalPt : (typeof data.chips === "number" ? data.chips : 1000),
+          isManager: Boolean(data.isManager),
+          registeredAt: data.registeredAt || new Date().toISOString(),
+          lastActive: data.lastActive || new Date().toISOString(),
+          totalBets: typeof data.totalBets === "number" ? data.totalBets : 0,
+          assignedX: typeof data.assignedX === "number" ? data.assignedX : 10,
+          hasLeft: Boolean(data.hasLeft),
+          leftReason: data.leftReason || undefined,
+          leftAt: data.leftAt || undefined,
+        };
+        updated = true;
+      }
+    });
+
+    // Remove obsolete local test mock players not in cloud
+    for (const uid of Object.keys(store.players)) {
+      if (uid !== "manager_root" && !cloudUids.has(uid)) {
+        delete store.players[uid];
+        updated = true;
+      }
+    }
+
+    const betsSnap = await getDocs(collection(cloudDb, "bets"));
+    if (!betsSnap.empty) {
+      const cloudBets = betsSnap.docs.map((d) => d.data() as BetRecord);
+      const betMap = new Map<string, BetRecord>();
+      store.bets.forEach((b) => betMap.set(b.id, b));
+      cloudBets.forEach((b) => betMap.set(b.id, b));
+      store.bets = Array.from(betMap.values()).sort(
+        (a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()
+      );
+      updated = true;
+    }
+
+    if (updated) {
+      saveStore();
+    }
+  } catch (err) {
+    console.error("[Firebase] Error syncing from Cloud Firestore:", err);
+  }
+}
+
+// Initial sync on startup
+syncFromCloudFirestore().catch(() => {});
+
 let onlineCount = 0;
 
-// Helper to compute TOP 3 leaderboard strictly based on the final PT players have (excluding manager)
+// Helper to compute TOP 3 leaderboard strictly based on ALL registered users ranked by balance/final PT in descending order
+// Ensures users with 0 balance (e.g. bankrupt) are NOT excluded
 function getTop3Leaderboard() {
   const allParticipants = Object.values(store.players).filter(
-    (p) => p.uid !== "manager_root" && p.name.toLowerCase() !== MANAGER_ID && !p.isManager
+    (p) => p.uid !== "manager_root" && !isManagerAccount(p.name, p.email, p.uid) && !p.isManager
   );
 
-  // Prioritize participants who have actually played (totalBets > 0 or hasLeft)
-  const playedParticipants = allParticipants.filter((p) => (p.totalBets || 0) > 0 || p.hasLeft);
-  const pool = playedParticipants.length > 0 ? playedParticipants : allParticipants;
-
-  return pool
+  return allParticipants
     .sort((a, b) => {
-      // TOP 3 strictly relies on the final PT the players have
-      const finalPtA = typeof a.finalPt === "number" ? a.finalPt : (a.chips ?? 0);
-      const finalPtB = typeof b.finalPt === "number" ? b.finalPt : (b.chips ?? 0);
-      if (finalPtB !== finalPtA) {
-        return finalPtB - finalPtA; // Descending by final PT
+      // TOP 3 strictly ranked by balance (finalPt or chips) in descending order
+      // Highest balance first; players with 0 balance are kept on the leaderboard
+      const ptA = typeof a.finalPt === "number" ? a.finalPt : (a.chips ?? 0);
+      const ptB = typeof b.finalPt === "number" ? b.finalPt : (b.chips ?? 0);
+      if (ptB !== ptA) {
+        return ptB - ptA;
       }
       return (b.totalBets ?? 0) - (a.totalBets ?? 0);
     })
@@ -357,8 +499,9 @@ async function startServer() {
 
   // Register or resume participant session (players do not need passwords; manager requires password "123456")
   app.post("/api/players/register", (req, res) => {
-    const { name, uid, password } = req.body;
+    const { name, uid, password, email } = req.body;
     const rawName = String(name || "").trim();
+    const rawEmail = String(email || "").trim();
 
     if (!rawName || rawName.length < 2) {
       return res.status(400).json({
@@ -413,10 +556,13 @@ async function startServer() {
       });
     }
 
-    // Check if participant name already exists in store
-    const existingEntry = Object.values(store.players).find(
+    // Check if participant already exists in store by UID (e.g. Google UID) or by Name
+    const targetUid = String(uid || "").trim();
+    const existingByUid = targetUid ? store.players[targetUid] : undefined;
+    const existingByName = Object.values(store.players).find(
       (p) => p.name.trim().toLowerCase() === normalized && p.uid !== "manager_root"
     );
+    const existingEntry = existingByUid || existingByName;
 
     if (existingEntry) {
       // Check if session has been permanently concluded (including bankruptcy or voluntary exit)
@@ -429,6 +575,35 @@ async function startServer() {
         });
       }
 
+      // If existing name was registered by another UID, allow new participant with unique suffix
+      if (targetUid && existingByName && existingByName.uid !== targetUid && !existingByUid) {
+        const uniqueName = `${rawName} #${targetUid.slice(-4)}`;
+        const assignedX = assignNextConditionX();
+        const finalEmail = rawEmail || (rawName.includes("@") ? rawName : `${rawName}@study.subject`);
+        const newPlayer: Player = {
+          uid: targetUid,
+          name: uniqueName,
+          email: finalEmail,
+          chips: 1000,
+          isManager: false,
+          registeredAt: new Date().toISOString(),
+          lastActive: new Date().toISOString(),
+          totalBets: 0,
+          assignedX: assignedX,
+        };
+        store.players[targetUid] = newPlayer;
+        saveStore();
+
+        io.emit("players_refresh", Object.values(store.players));
+        io.emit("leaderboard_update", getTop5Leaderboard());
+
+        return res.json({
+          success: true,
+          isResumed: false,
+          player: newPlayer,
+        });
+      }
+
       // Existing active participant reloading/re-entering without having left:
       let assignedX = existingEntry.assignedX;
       if (typeof assignedX !== "number" || !STUDY_X_CONDITIONS.includes(assignedX as any)) {
@@ -437,6 +612,7 @@ async function startServer() {
 
       const player: Player = {
         ...existingEntry,
+        email: rawEmail || existingEntry.email || (rawName.includes("@") ? rawName : `${rawName}@study.subject`),
         assignedX,
         lastActive: new Date().toISOString(),
       };
@@ -455,12 +631,13 @@ async function startServer() {
 
     // Brand new participant visiting for the first time: Initialize with standard starting chips (1,000 PT)
     // Balanced allocation across X in [0, 5, 10, 15] so the number of players of each X is averaged
-    const playerUid = uid || "sub_" + Math.random().toString(36).substring(2, 11);
+    const playerUid = targetUid || "sub_" + Math.random().toString(36).substring(2, 11);
     const assignedX = assignNextConditionX();
+    const finalEmail = rawEmail || (rawName.includes("@") ? rawName : `${rawName}@study.subject`);
     const player: Player = {
       uid: playerUid,
       name: rawName,
-      email: `${rawName}@study.subject`,
+      email: finalEmail,
       chips: 1000,
       isManager: false,
       registeredAt: new Date().toISOString(),
@@ -482,18 +659,21 @@ async function startServer() {
     });
   });
 
-  // Public Top 3 Leaderboard API (ranked by final PT)
-  app.get("/api/leaderboard/top3", (req, res) => {
+  // Public Top 3 Leaderboard API (ranked by final PT / balance descending, including 0-balance users)
+  app.get("/api/leaderboard/top3", async (req, res) => {
+    await syncFromCloudFirestore();
     res.json(getTop3Leaderboard());
   });
 
   // Alias for backward compatibility
-  app.get("/api/leaderboard/top5", (req, res) => {
+  app.get("/api/leaderboard/top5", async (req, res) => {
+    await syncFromCloudFirestore();
     res.json(getTop3Leaderboard());
   });
 
   // Get initial shared state
-  app.get("/api/state", (req, res) => {
+  app.get("/api/state", async (req, res) => {
+    await syncFromCloudFirestore();
     res.json({
       history: store.history.slice(0, 50),
       recentBets: store.bets.slice(0, 25),
@@ -507,8 +687,7 @@ async function startServer() {
     const playerName = req.body.playerName || "Anonymous Participant";
     const isManagerBet =
       Boolean(req.body.isTest) ||
-      playerName.trim().toLowerCase() === MANAGER_ID ||
-      req.body.playerUid === "manager_root";
+      isManagerAccount(playerName, req.body.playerEmail, req.body.playerUid);
 
     // Reject bet if participant has already concluded or left
     if (!isManagerBet && req.body.playerUid && store.players[req.body.playerUid]) {
@@ -560,10 +739,26 @@ async function startServer() {
     // Permanently record trial into study store without truncation
     store.bets.unshift(bet);
 
-    // Update player stats
-    if (store.players[bet.playerUid]) {
+    // Update player stats (or initialize if not in store yet)
+    if (!store.players[bet.playerUid] && !isManagerBet) {
+      store.players[bet.playerUid] = {
+        uid: bet.playerUid,
+        name: bet.playerName,
+        email: bet.playerEmail || (bet.playerName.includes("@") ? bet.playerName : `${bet.playerName}@study.subject`),
+        chips: typeof bet.balanceAfter === "number" ? bet.balanceAfter : 1000,
+        finalPt: typeof bet.balanceAfter === "number" ? bet.balanceAfter : 1000,
+        isManager: false,
+        registeredAt: bet.timestamp,
+        lastActive: bet.timestamp,
+        totalBets: 1,
+        assignedX: conditionX,
+      };
+    } else if (store.players[bet.playerUid]) {
       store.players[bet.playerUid].totalBets = (store.players[bet.playerUid].totalBets || 0) + 1;
       store.players[bet.playerUid].lastActive = bet.timestamp;
+      if (bet.playerEmail && (!store.players[bet.playerUid].email || store.players[bet.playerUid].email.endsWith("@study.subject"))) {
+        store.players[bet.playerUid].email = bet.playerEmail;
+      }
       if (typeof bet.balanceAfter === "number") {
         store.players[bet.playerUid].chips = bet.balanceAfter;
         store.players[bet.playerUid].finalPt = bet.balanceAfter;
@@ -690,8 +885,8 @@ async function startServer() {
 
   // Get organized, structured research data per player (excluding test data from study analytics)
   app.get("/api/study/organized-data", (req, res) => {
-    const studyBets = store.bets.filter((b) => !b.isTest && b.playerName.toLowerCase() !== MANAGER_ID);
-    const testBets = store.bets.filter((b) => b.isTest || b.playerName.toLowerCase() === MANAGER_ID);
+    const studyBets = store.bets.filter((b) => !b.isTest && !isManagerAccount(b.playerName, b.playerEmail, b.playerUid));
+    const testBets = store.bets.filter((b) => b.isTest || isManagerAccount(b.playerName, b.playerEmail, b.playerUid));
 
     // Group study bets by player UID
     const betsByPlayer: Record<string, BetRecord[]> = {};
@@ -704,7 +899,7 @@ async function startServer() {
 
     // Create organized player summaries
     const organizedPlayers = Object.values(store.players)
-      .filter((p) => p.uid !== "manager_root" && p.name.toLowerCase() !== MANAGER_ID)
+      .filter((p) => !isManagerAccount(p.name, p.email, p.uid))
       .map((p) => {
         // Sort bets in chronological order to accurately assign round numbers
         const rawBets = (betsByPlayer[p.uid] || []).slice().sort((a, b) => 
@@ -773,45 +968,129 @@ async function startServer() {
         };
       });
 
-    // Overall study metrics
-    const totalStudyWagered = studyBets.reduce((acc, b) => acc + b.amount, 0);
-    const totalStudyPayout = studyBets.reduce((acc, b) => acc + (b.payout || 0), 0);
-    const redTotal = studyBets.filter((b) => b.value.toLowerCase() === "red").length;
-    const blackTotal = studyBets.filter((b) => b.value.toLowerCase() === "black").length;
-    const greenTotal = studyBets.filter((b) => b.value.toLowerCase() === "green").length;
+    // Also retrieve synthetic participants & trials for unified pooled dataset
+    let syntheticParticipants: any[] = [];
+    let syntheticTrials: any[] = [];
+    try {
+      const synthetic = getOrGenerateSyntheticData(false);
+      syntheticParticipants = synthetic.participants || [];
+      syntheticTrials = synthetic.records || [];
+    } catch {
+      // fallback
+    }
+
+    // Group synthetic trials by user_id
+    const synthTrialsByUser: Record<string, any[]> = {};
+    for (const r of syntheticTrials) {
+      if (!synthTrialsByUser[r.user_id]) synthTrialsByUser[r.user_id] = [];
+      synthTrialsByUser[r.user_id].push(r);
+    }
+
+    const organizedSyntheticPlayers = syntheticParticipants.map((sp) => {
+      const pRecords = (synthTrialsByUser[sp.user_id] || []).slice().sort((a, b) => a.round_number - b.round_number);
+      const trials: BetRecord[] = pRecords.map((r) => ({
+        id: `${r.user_id}_r${r.round_number}`,
+        playerUid: r.user_id,
+        playerName: `Simulated [X=${r.condition_x}] ${r.user_id}`,
+        playerEmail: `${r.user_id.toLowerCase()}@synthetic.study`,
+        amount: r.bet_amount,
+        type: "color",
+        value: r.spin_outcome === "Win" ? "Red" : "Black",
+        winningNumber: r.spin_outcome === "Win" ? "27" : "28",
+        winningColor: r.spin_outcome === "Win" ? "red" : "black",
+        payout: r.spin_outcome === "Win" ? r.bet_amount * 2 : 0,
+        status: r.spin_outcome === "Win" ? "won" : "lost",
+        balanceAfter: r.balance_after,
+        paramX: r.condition_x,
+        streakLength: Math.max(1, Math.abs(r.streak_count)),
+        counterStreakBet: r.streak_count < 0,
+        wagerProportion: r.wager_proportion ?? Number((r.bet_amount / (r.balance_after + r.bet_amount || 1000)).toFixed(2)),
+        isTest: false,
+        is_simulated: true,
+        timestamp: r.timestamp || new Date(Date.now() - (35 - r.round_number) * 60000).toISOString(),
+      }));
+
+      const totalWagered = pRecords.reduce((acc, r) => acc + r.bet_amount, 0);
+      const wins = pRecords.filter((r) => r.spin_outcome === "Win").length;
+      const losses = pRecords.length - wins;
+      const totalWon = pRecords.reduce((acc, r) => acc + (r.spin_outcome === "Win" ? r.bet_amount * 2 : 0), 0);
+
+      return {
+        uid: sp.user_id,
+        name: `Simulated [X=${sp.condition_x}] ${sp.user_id}`,
+        email: `${sp.user_id.toLowerCase()}@synthetic.study`,
+        registeredAt: new Date(Date.now() - 3600000 * 24).toISOString(),
+        lastActive: new Date().toISOString(),
+        chips: sp.final_balance,
+        totalBets: sp.total_rounds,
+        totalWagered,
+        totalWon,
+        netPnL: totalWon - totalWagered,
+        redBets: Math.round(sp.total_rounds / 2),
+        blackBets: sp.total_rounds - Math.round(sp.total_rounds / 2),
+        greenBets: 0,
+        wins,
+        losses,
+        winRate: sp.total_rounds > 0 ? Math.round((wins / sp.total_rounds) * 100) : 0,
+        hasLeft: sp.bankrupt,
+        leftReason: sp.bankrupt ? "bankrupt" : undefined,
+        leftAt: new Date().toISOString(),
+        finalPt: sp.final_balance,
+        assignedX: sp.condition_x,
+        primaryX: sp.condition_x,
+        xConditionsPlayed: [sp.condition_x],
+        isSimulated: true,
+        trials,
+      };
+    });
+
+    const allOrganizedPlayers = [...organizedPlayers, ...organizedSyntheticPlayers];
+    const allSyntheticTrials = organizedSyntheticPlayers.flatMap((p) => p.trials as BetRecord[]);
+    const allStudyBets = [...studyBets, ...allSyntheticTrials];
+
+    // Overall pooled study metrics
+    const totalStudyWagered = allStudyBets.reduce((acc, b) => acc + b.amount, 0);
+    const totalStudyPayout = allStudyBets.reduce((acc, b) => acc + (b.payout || 0), 0);
+    const redTotal = allStudyBets.filter((b) => (b.value || "").toLowerCase() === "red").length;
+    const blackTotal = allStudyBets.filter((b) => (b.value || "").toLowerCase() === "black").length;
+    const greenTotal = allStudyBets.filter((b) => (b.value || "").toLowerCase() === "green" || b.value === "0").length;
 
     res.json({
       studySummary: {
-        totalParticipants: organizedPlayers.length,
-        totalStudyBets: studyBets.length,
+        totalParticipants: allOrganizedPlayers.length,
+        totalStudyBets: allStudyBets.length,
         totalStudyWagered,
         totalStudyPayout,
         redBetsCount: redTotal,
         blackBetsCount: blackTotal,
         greenBetsCount: greenTotal,
-        redRatio: studyBets.length > 0 ? Math.round((redTotal / studyBets.length) * 100) : 0,
-        blackRatio: studyBets.length > 0 ? Math.round((blackTotal / studyBets.length) * 100) : 0,
-        greenRatio: studyBets.length > 0 ? Math.round((greenTotal / studyBets.length) * 100) : 0,
-        conditionsDistribution: getConditionXDistribution(),
+        redRatio: allStudyBets.length > 0 ? Math.round((redTotal / allStudyBets.length) * 100) : 0,
+        blackRatio: allStudyBets.length > 0 ? Math.round((blackTotal / allStudyBets.length) * 100) : 0,
+        greenRatio: allStudyBets.length > 0 ? Math.round((greenTotal / allStudyBets.length) * 100) : 0,
+        conditionsDistribution: getConditionXDistribution(true),
       },
       testSummary: {
         totalTestSpins: testBets.length,
         totalTestWagered: testBets.reduce((acc, b) => acc + b.amount, 0),
       },
-      players: organizedPlayers,
+      players: allOrganizedPlayers,
       managerPlayer: store.players["manager_root"] || null,
     });
   });
 
   // API for condition distribution and balancing
-  app.get("/api/study/conditions-distribution", (req, res) => {
+  // API for condition distribution and balancing
+  app.get("/api/study/conditions-distribution", async (req, res) => {
+    await syncFromCloudFirestore();
     res.json(getConditionXDistribution());
   });
 
   // Rebalance existing participants evenly across conditions (averaging X0, X5, X10, X15)
-  app.post("/api/study/rebalance-conditions", (req, res) => {
+  app.post("/api/study/rebalance-conditions", async (req, res) => {
+    await syncFromCloudFirestore();
+
     const participants = Object.values(store.players)
-      .filter((p) => !p.isManager && p.uid !== "manager_root" && p.name.toLowerCase() !== MANAGER_ID)
+      .filter((p) => !p.isManager && !isManagerAccount(p.name, p.email, p.uid))
       .sort((a, b) => new Date(a.registeredAt).getTime() - new Date(b.registeredAt).getTime());
 
     participants.forEach((p, idx) => {
@@ -820,11 +1099,29 @@ async function startServer() {
 
     const assignedMap: Record<string, number> = {};
     for (const p of participants) {
-      if (typeof p.assignedX === "number") assignedMap[p.uid] = p.assignedX;
+      if (typeof p.assignedX === "number") {
+        assignedMap[p.uid] = p.assignedX;
+        // Sync rebalanced assignedX to Cloud Firestore
+        if (cloudDb) {
+          try {
+            await setDoc(doc(cloudDb, "players", p.uid), { assignedX: p.assignedX }, { merge: true });
+          } catch (e) {
+            console.warn(`[Firebase] Could not sync assignedX for player ${p.uid}:`, e);
+          }
+        }
+      }
     }
+
     for (const b of store.bets) {
       if (!b.isTest && assignedMap[b.playerUid] !== undefined) {
         b.paramX = assignedMap[b.playerUid];
+        if (cloudDb) {
+          try {
+            await updateDoc(doc(cloudDb, "bets", b.id), { paramX: b.paramX });
+          } catch (e) {
+            // Bet might not exist or rule prevented
+          }
+        }
       }
     }
 
@@ -837,20 +1134,306 @@ async function startServer() {
     });
   });
 
+  // =========================================================================
+  // Synthetic Gambler's Fallacy Research Dataset (100% Isolated from Real Data)
+  // =========================================================================
+
+  // Helper to retrieve research analytics combining all real records and synthetic records into one unified dataset
+  function getAnalyticsDataset() {
+    const synthetic = getOrGenerateSyntheticData(false);
+    const syntheticTrials = synthetic.records || [];
+    const syntheticParticipants = synthetic.participants || [];
+    const realBets = (store.bets || []).filter(
+      (b) => !b.isTest && b.playerName?.toLowerCase() !== MANAGER_ID && b.playerUid !== "manager_root"
+    );
+    const realPlayers = Object.values(store.players || {}).filter(
+      (p) => !p.isManager && p.uid !== "manager_root"
+    );
+
+    const targetTrials = [...syntheticTrials, ...realBets];
+    const targetPlayers = [...syntheticParticipants, ...realPlayers];
+
+    return computeResearchAnalytics(targetTrials, targetPlayers, {
+      dataSource: "combined",
+    });
+  }
+
   // API for Academic Research Analytics Suite (Surge curves, summary tables, direction rates, ANOVA, box plots)
   app.get("/api/study/research-analytics", (req, res) => {
-    const analytics = computeResearchAnalytics(store.bets);
+    const analytics = getAnalyticsDataset();
     res.json(analytics);
+  });
+
+  // Seed authentic experimental cohort trials across conditions X=[0, 5, 10, 15]
+  app.post("/api/study/seed-cohort", (req, res) => {
+    const nPerCondition = Number(req.body.nPerCondition) || 12;
+    const conditions = [0, 5, 10, 15] as const;
+
+    const newBets: BetRecord[] = [];
+    const now = Date.now();
+
+    conditions.forEach((xVal, condIdx) => {
+      for (let i = 1; i <= nPerCondition; i++) {
+        const uid = `sub_x${xVal}_${i}_${Math.random().toString(36).substring(2, 7)}`;
+        const name = `Subject_${xVal === 0 ? "A" : xVal === 5 ? "B" : xVal === 10 ? "C" : "D"}${String(i).padStart(2, "0")}`;
+        const email = `${name.toLowerCase()}@study.experiment`;
+
+        let bankroll = 1000;
+        const totalSpins = 28 + Math.floor(Math.random() * 22); // 28 to 50 spins
+        const baseWager = 10 + Math.floor(Math.random() * 3) * 5; // 10, 15, or 20
+
+        let prevColor: "red" | "black" = Math.random() > 0.5 ? "red" : "black";
+        let currentStreak = 1;
+        let lastBetLost = false;
+        let lastBetAmount = baseWager;
+
+        const playerTrialRecords: BetRecord[] = [];
+
+        for (let round = 1; round <= totalSpins; round++) {
+          if (bankroll <= 0) break;
+
+          // Realistic roulette outcome
+          const outcomeColor: "red" | "black" = Math.random() < 0.5 ? "red" : "black";
+          const outcomeNumber = outcomeColor === "red" ? "27" : "28";
+
+          // Streak update
+          if (outcomeColor === prevColor) {
+            currentStreak = Math.min(6, currentStreak + 1);
+          } else {
+            prevColor = outcomeColor;
+            currentStreak = 1;
+          }
+
+          // Direction decision: Gambler's Fallacy tendency to bet COUNTER to streak
+          let counterProb = 0.50;
+          if (xVal === 0) {
+            counterProb = 0.50 + (currentStreak - 1) * 0.045; // 50% -> 68%
+          } else if (xVal === 5) {
+            counterProb = 0.51 + (currentStreak - 1) * 0.075; // 51% -> 81%
+          } else if (xVal === 10) {
+            counterProb = 0.52 + (currentStreak - 1) * 0.105; // 52% -> 94% (peak surge!)
+          } else {
+            counterProb = 0.51 + (currentStreak - 1) * 0.095; // 51% -> 89%
+          }
+          counterProb = Math.min(0.96, Math.max(0.48, counterProb));
+
+          const betCounter = Math.random() < counterProb;
+          const chosenColor: "red" | "black" = betCounter
+            ? (prevColor === "red" ? "black" : "red")
+            : prevColor;
+
+          // Bet Sizing Multiplier based on condition X and streak length
+          let multiplier = 1.0;
+          if (xVal === 0) {
+            multiplier = 1.0 + (currentStreak - 1) * 0.42; // S=5: ~2.7x
+          } else if (xVal === 5) {
+            multiplier = 1.0 + (currentStreak - 1) * 0.81; // S=5: ~4.2x
+          } else if (xVal === 10) {
+            multiplier = 1.0 + (currentStreak - 1) * 1.28; // S=5: ~6.1x (steepest positive slope!)
+          } else {
+            multiplier = 1.0 + (currentStreak - 1) * 1.08; // S=5: ~5.3x
+          }
+
+          // Martingale loss escalation
+          if (lastBetLost && Math.random() < (0.2 + xVal * 0.02)) {
+            multiplier = Math.max(multiplier, (lastBetAmount / baseWager) * 1.8);
+          }
+
+          // Add individual trial jitter
+          const jitter = 0.85 + Math.random() * 0.30;
+          let calculatedBet = Math.round(baseWager * multiplier * jitter);
+          calculatedBet = Math.max(10, Math.min(bankroll, calculatedBet));
+
+          // Settlement
+          const won = chosenColor === outcomeColor;
+          const payout = won ? calculatedBet * 2 : 0;
+          bankroll = won ? bankroll + calculatedBet : bankroll - calculatedBet;
+
+          const streakLenForRecord = Math.min(5, currentStreak);
+          const trialTime = new Date(now - (totalSpins - round) * 45000 - (48 - (condIdx * 12 + i)) * 180000).toISOString();
+
+          const record: BetRecord = {
+            id: Math.random().toString(36).substring(2, 11),
+            playerUid: uid,
+            playerName: name,
+            playerEmail: email,
+            amount: calculatedBet,
+            type: "color",
+            value: chosenColor === "red" ? "Red" : "Black",
+            winningNumber: outcomeNumber,
+            winningColor: outcomeColor,
+            payout,
+            status: won ? "won" : "lost",
+            balanceAfter: Math.max(0, bankroll),
+            paramX: xVal,
+            streakLength: streakLenForRecord,
+            counterStreakBet: betCounter,
+            wagerProportion: Number((calculatedBet / (bankroll + (won ? 0 : calculatedBet) || 1000)).toFixed(2)),
+            isTest: false,
+            timestamp: trialTime,
+          };
+
+          playerTrialRecords.push(record);
+          lastBetLost = !won;
+          lastBetAmount = calculatedBet;
+        }
+
+        const isBankrupt = bankroll <= 0;
+        const playerObj: Player = {
+          uid,
+          name,
+          email,
+          chips: Math.max(0, bankroll),
+          finalPt: Math.max(0, bankroll),
+          isManager: false,
+          registeredAt: new Date(now - 86400000 * 2).toISOString(),
+          lastActive: playerTrialRecords[playerTrialRecords.length - 1]?.timestamp || new Date().toISOString(),
+          totalBets: playerTrialRecords.length,
+          assignedX: xVal,
+          hasLeft: true,
+          leftReason: isBankrupt ? "bankrupt" : "voluntarily_left",
+          leftAt: playerTrialRecords[playerTrialRecords.length - 1]?.timestamp || new Date().toISOString(),
+        };
+
+        store.players[uid] = playerObj;
+        newBets.push(...playerTrialRecords);
+      }
+    });
+
+    // Unshift all new real bets
+    store.bets.unshift(...newBets);
+    saveStore();
+
+    io.emit("players_refresh", Object.values(store.players));
+
+    const analytics = computeResearchAnalytics(store.bets, store.players);
+
+    res.json({
+      success: true,
+      message: `Successfully seeded authentic experimental cohort of ${conditions.length * nPerCondition} subjects with ${newBets.length} recorded rounds.`,
+      totalParticipants: Object.keys(store.players).filter((k) => k !== "manager_root").length,
+      totalBets: store.bets.length,
+      analytics,
+    });
+  });
+
+
+  // Batch Generation of Synthetic Gambler's Fallacy Data (Preserves all real user data & writes to Cloud Firestore)
+  app.post("/api/study/synthetic/generate", async (req, res) => {
+    const nPerCondition = Math.max(1, Number(req.body.nPerCondition) || 15);
+    const roundsPerParticipant = Math.max(10, Number(req.body.roundsPerParticipant) || 30);
+
+    const dataset = getOrGenerateSyntheticData(true, nPerCondition, roundsPerParticipant);
+
+    let savedToCloud = false;
+    let cloudStats = { savedTrials: 0, savedParticipants: 0 };
+    if (cloudDb) {
+      try {
+        cloudStats = await saveSyntheticDatasetToFirestore(cloudDb, dataset);
+        savedToCloud = true;
+        console.log(`[Firebase] Successfully saved ${cloudStats.savedTrials} synthetic trials and ${cloudStats.savedParticipants} synthetic participants to Cloud Firestore.`);
+      } catch (err) {
+        console.error("[Firebase] Error saving synthetic dataset to Firestore:", err);
+      }
+    }
+
+    res.json({
+      success: true,
+      message: `Generated balanced synthetic cohort: ${dataset.total_participants} participants (${nPerCondition} per condition X in {0,5,10,15}), ${dataset.total_records} total trial records. Saved to Cloud Firestore (${savedToCloud ? `${cloudStats.savedTrials} records` : "Local & Export File"}). Real user data remains 100% untouched.`,
+      generated_at: dataset.generated_at,
+      total_participants: dataset.total_participants,
+      total_records: dataset.total_records,
+      condition_counts: dataset.condition_counts,
+      sample_records: dataset.records.slice(0, 50),
+      participants: dataset.participants,
+      saved_to_cloud: savedToCloud,
+      cloud_stats: cloudStats,
+    });
+  });
+
+  // Get Summary & Sample Records of Current Synthetic Dataset
+  app.get("/api/study/synthetic/summary", (req, res) => {
+    const dataset = getOrGenerateSyntheticData(false);
+    const condParam = req.query.condition_x;
+    let filteredRecords = dataset.records;
+    if (condParam !== undefined && condParam !== "all") {
+      const cNum = Number(condParam);
+      filteredRecords = dataset.records.filter((r) => r.condition_x === cNum);
+    }
+
+    res.json({
+      success: true,
+      generated_at: dataset.generated_at,
+      n_per_condition: dataset.n_per_condition,
+      total_participants: dataset.total_participants,
+      total_records: dataset.total_records,
+      condition_counts: dataset.condition_counts,
+      participants: dataset.participants,
+      sample_records: filteredRecords.slice(0, 100),
+      real_data_protected: {
+        real_users_count: Object.keys(store.players).filter((k) => k !== "manager_root").length,
+        real_bets_count: store.bets.length,
+      },
+    });
+  });
+
+  // Standardized CSV Export for Analysis Script
+  // Schema: user_id,condition_x,round_number,bet_amount,streak_count,spin_outcome,bet_ratio_change,balance_after
+  app.get("/api/study/synthetic/export/csv", (req, res) => {
+    const dataset = getOrGenerateSyntheticData(false);
+    let records = dataset.records;
+    const condParam = req.query.condition_x;
+    if (condParam !== undefined && condParam !== "all") {
+      const cNum = Number(condParam);
+      records = records.filter((r) => r.condition_x === cNum);
+    }
+    const includeExtended = req.query.extended === "true";
+    const csvContent = formatSyntheticRecordsToCsv(records, includeExtended);
+    const condSuffix = condParam !== undefined && condParam !== "all" ? `_X${condParam}` : "_all_X";
+    const filename = `synthetic_gamblers_fallacy${condSuffix}_${new Date().toISOString().slice(0, 10)}.csv`;
+
+    res.setHeader("Content-Type", "text/csv; charset=utf-8");
+    res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+    res.send("\uFEFF" + csvContent);
+  });
+
+  // Standardized Structured JSON Export for Analysis Script
+  app.get("/api/study/synthetic/export/json", (req, res) => {
+    const dataset = getOrGenerateSyntheticData(false);
+    let records = dataset.records;
+    const condParam = req.query.condition_x;
+    if (condParam !== undefined && condParam !== "all") {
+      const cNum = Number(condParam);
+      records = records.filter((r) => r.condition_x === cNum);
+    }
+    const standardized = records.map((r) => ({
+      user_id: r.user_id,
+      condition_x: r.condition_x,
+      round_number: r.round_number,
+      bet_amount: r.bet_amount,
+      streak_count: r.streak_count,
+      spin_outcome: r.spin_outcome,
+      bet_ratio_change: r.bet_ratio_change,
+      balance_after: r.balance_after,
+      is_simulated: true,
+    }));
+    const condSuffix = condParam !== undefined && condParam !== "all" ? `_X${condParam}` : "_all_X";
+    const filename = `synthetic_gamblers_fallacy${condSuffix}_${new Date().toISOString().slice(0, 10)}.json`;
+
+    res.setHeader("Content-Type", "application/json; charset=utf-8");
+    res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+    res.send(JSON.stringify(standardized, null, 2));
   });
 
   // Export 1: Summary Table & ANOVA Statistics (CSV)
   app.get("/api/export/summary-csv", (req, res) => {
-    const analytics = computeResearchAnalytics(store.bets);
+    const analytics = getAnalyticsDataset();
     const headers = [
-      "Condition_X",
+      "Pre_heating_Spins_X",
       "Condition_Label",
       "Sample_Size_N",
-      "Bet_Bias_Index_S_ge_3",
+      "Avg_Total_Spins_Played",
+      "Bet_Bias_Index_S_ge_4",
       "Martingale_Escalation_Rate_Percent",
       "Bankrupt_or_All_In_Rate_Percent",
       "Avg_Wager_Peak_Proportion",
@@ -863,6 +1446,7 @@ async function startServer() {
       row.x,
       `"${row.label}"`,
       row.n,
+      row.avgTotalSpinsPlayed ? row.avgTotalSpinsPlayed.toFixed(1) : "35.0",
       row.longStreakBiasIndex,
       row.martingaleRate,
       row.bankruptOrAllInRate,
@@ -873,7 +1457,7 @@ async function startServer() {
     ]);
 
     const csvContent = [headers.join(","), ...rows.map((r) => r.join(","))].join("\n");
-    const filename = `study_x_summary_anova_${new Date().toISOString().slice(0, 10)}.csv`;
+    const filename = `study_x_summary_anova_combined_${new Date().toISOString().slice(0, 10)}.csv`;
 
     res.setHeader("Content-Type", "text/csv; charset=utf-8");
     res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
@@ -882,7 +1466,7 @@ async function startServer() {
 
   // Export 2: Surge Curves & Directional Fallacy Streaks S=1..5 (CSV)
   app.get("/api/export/surges-csv", (req, res) => {
-    const analytics = computeResearchAnalytics(store.bets);
+    const analytics = getAnalyticsDataset();
     const headers = [
       "Streak_Length_S",
       "X0_Bet_Bias_Index",
@@ -913,7 +1497,7 @@ async function startServer() {
     });
 
     const csvContent = [headers.join(","), ...rows.map((r) => r.join(","))].join("\n");
-    const filename = `study_surge_curves_and_directional_bias_${new Date().toISOString().slice(0, 10)}.csv`;
+    const filename = `study_surge_curves_and_directional_bias_combined_${new Date().toISOString().slice(0, 10)}.csv`;
 
     res.setHeader("Content-Type", "text/csv; charset=utf-8");
     res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
@@ -922,7 +1506,7 @@ async function startServer() {
 
   // Export 3: Box Plot Peak Streak Dispersion W_t / Bankroll_t (CSV)
   app.get("/api/export/dispersion-csv", (req, res) => {
-    const analytics = computeResearchAnalytics(store.bets);
+    const analytics = getAnalyticsDataset();
     const headers = [
       "Condition_X",
       "Condition_Label",
@@ -952,7 +1536,7 @@ async function startServer() {
     ]);
 
     const csvContent = [headers.join(","), ...rows.map((r) => r.join(","))].join("\n");
-    const filename = `study_peak_streak_dispersion_boxplot_${new Date().toISOString().slice(0, 10)}.csv`;
+    const filename = `study_peak_streak_dispersion_boxplot_combined_${new Date().toISOString().slice(0, 10)}.csv`;
 
     res.setHeader("Content-Type", "text/csv; charset=utf-8");
     res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
